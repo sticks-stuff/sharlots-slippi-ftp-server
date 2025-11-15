@@ -21,6 +21,7 @@ from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
 import urllib.parse
 from statx import statx
+import csv
 
 app = Flask(__name__)
 
@@ -35,6 +36,76 @@ spectatormode_live_files = {}
 
 SLIPPILAB_UPLOADS_FILE = "slippilab_uploaded.json"
 slippilab_uploaded = {}  # {abs_path: slippilab_id}
+
+# Optional CSV mapping for creation times (epoch seconds) by filename
+CREATION_TIMES_CSV = "creation_times.csv"
+creation_times_map = {}
+creation_times_csv_path = None
+creation_times_csv_mtime = None
+
+def load_creation_times_csv(force=False):
+    """Load and cache the optional creation_times.csv if present.
+
+    CSV format:
+        timestamp,filename
+        1760832724,Game_20251019T131204.slp
+    """
+    global creation_times_map, creation_times_csv_mtime, creation_times_csv_path
+    path = CREATION_TIMES_CSV
+    creation_times_csv_path = path
+    if not os.path.exists(path):
+        # Clear cache if previously loaded
+        if creation_times_map:
+            creation_times_map = {}
+            creation_times_csv_mtime = None
+        return
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = None
+    if not force and creation_times_csv_mtime is not None and mtime == creation_times_csv_mtime:
+        return  # Up-to-date
+    tmp = {}
+    try:
+        with open(path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row:
+                    continue
+                ts = (row.get('timestamp') or '').strip()
+                fname = (row.get('filename') or '').strip()
+                if not ts or not fname:
+                    continue
+                try:
+                    tmp[fname] = int(ts)
+                except Exception:
+                    continue
+        creation_times_map = tmp
+        creation_times_csv_mtime = mtime
+        print(f"[INFO] Loaded {CREATION_TIMES_CSV} with {len(creation_times_map)} entries from {path}", flush=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to load {CREATION_TIMES_CSV} from {path}: {e}", flush=True)
+
+def get_created_time_string(filename, filepath):
+    """Return created time string 'YYYY-mm-dd HH:MM:SS' using CSV override if available."""
+    try:
+        # Refresh cache if CSV exists/changed
+        load_creation_times_csv()
+        ts = creation_times_map.get(filename)
+        if ts:
+            return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
+    except Exception:
+        pass
+    # Fallbacks: statx btime -> st_ctime (Windows creation) -> st_mtime
+    try:
+        return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(statx(filepath).btime))
+    except Exception:
+        try:
+            st = os.stat(filepath)
+            t = getattr(st, 'st_ctime', None) or st.st_mtime
+            return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t))
+        except Exception:
+            return ''
 
 def load_slippilab_uploaded():
     global slippilab_uploaded
@@ -849,7 +920,7 @@ if __name__ == "__main__":
                     stat = os.stat(filepath)
                     size_mb = round(stat.st_size / (1024 * 1024), 2)
                     modified_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))
-                    created_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(statx(filepath).btime))
+                    created_time = get_created_time_string(filename, filepath)
                     is_active = os.path.abspath(filepath) in active_filepaths
                     cache_key = filename
                     cache_entry = gameinfo_cache.get(cache_key)
