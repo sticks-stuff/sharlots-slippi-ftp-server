@@ -43,6 +43,13 @@ creation_times_map = {}
 creation_times_csv_path = None
 creation_times_csv_mtime = None
 
+# --- Lightweight caching for /api/replays ---
+REPLAYS_SNAPSHOT_TTL = 1.0  # seconds
+gameinfo_cache = {}
+replays_snapshot = None
+replays_snapshot_mtime = 0.0
+replays_snapshot_lock = threading.Lock()
+
 def load_creation_times_csv(force=False):
     """Load and cache the optional creation_times.csv if present.
 
@@ -878,6 +885,214 @@ def port_to_number(port):
     except Exception:
         return port  # fallback
 
+# --- Snapshot builder for /api/replays to avoid per-request heavy work ---
+def compute_replays_snapshot():
+    replays = []
+    active_filepaths = set()
+
+    # Build set of active filepaths
+    for conn in MonitoringFTPHandler.active_connections:
+        if conn.get('transfer_active') and conn.get('current_file'):
+            current_file = conn.get('current_file') or ''
+            if 'Uploading:' in current_file:
+                filename = current_file.replace('Uploading:', '').strip()
+                active_filepaths.add(os.path.abspath(filename))
+            elif 'Downloading:' in current_file:
+                filename = current_file.replace('Downloading:', '').strip()
+                active_filepaths.add(os.path.abspath(filename))
+
+    if os.path.exists(FTP_ROOT):
+        for filename in os.listdir(FTP_ROOT):
+            filepath = os.path.join(FTP_ROOT, filename)
+            if not (os.path.isfile(filepath) and filename.endswith('.slp')):
+                continue
+            try:
+                stat_obj = os.stat(filepath)
+            except Exception:
+                continue
+            size_mb = round(stat_obj.st_size / (1024 * 1024), 2)
+            modified_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_obj.st_mtime))
+            created_time = get_created_time_string(filename, filepath)
+            is_active = os.path.abspath(filepath) in active_filepaths
+
+            cache_key = filename
+            cache_entry = gameinfo_cache.get(cache_key)
+            if (not is_active and cache_entry and cache_entry[0] == stat_obj.st_mtime):
+                game_info = cache_entry[1]
+            else:
+                stage_id = None
+                stage_name = None
+                players = []
+                game_info = {}
+                try:
+                    if is_active:
+                        # Live: avoid heavy lists; iterate to get last frame only
+                        info = live_slippi_info(filepath)
+                        last_frame = None
+                        try:
+                            for fr in live_slippi_frame_numbers(filepath):
+                                last_frame = fr
+                        except Exception:
+                            last_frame = None
+
+                        stage_id = int(info['start']['stage']) if info.get('start') and 'stage' in info['start'] else None
+                        stage_name = STAGE_ID_MAP.get(stage_id, f"Stage {stage_id}") if stage_id is not None else None
+                        if info.get('start', {}).get('is_frozen_ps', False) and stage_name == "Pokémon Stadium":
+                            stage_name = "Frozen Pokémon Stadium"
+
+                        player_list = info.get('start', {}).get('players', [])
+                        player_ports = [p['port'] for p in player_list] if player_list else []
+                        min_port = min(player_ports) if player_ports else 0
+                        players = []
+                        for p in player_list:
+                            char_id = int(p['character'])
+                            costume = int(p['costume'])
+                            char_name = CHARACTER_ID_MAP.get(char_id, f"char_{char_id}")
+                            port_key = 0 if p['port'] == min_port else 1
+                            stocks = None
+                            percent = None
+                            try:
+                                if last_frame is not None and hasattr(last_frame, 'ports') and len(last_frame.ports) > port_key:
+                                    port_data = last_frame.ports[port_key]
+                                    if hasattr(port_data, 'leader') and 'post' in port_data.leader and 'stocks' in port_data.leader['post']:
+                                        stocks = port_data.leader['post']['stocks']
+                                    if hasattr(port_data, 'leader') and 'post' in port_data.leader and 'percent' in port_data.leader['post']:
+                                        percent = port_data.leader['post']['percent']
+                            except Exception:
+                                stocks = None
+                                percent = None
+                            icon = f"/icon/chara_2_{char_name}_{str(costume).zfill(2)}.png"
+                            players.append({
+                                'port': port_to_number(p['port']),
+                                'character_id': char_id,
+                                'character': char_name,
+                                'costume': costume,
+                                'stock_count': stocks,
+                                'percent': percent,
+                                'icon': icon
+                            })
+
+                        starting_timer_seconds = info.get('start', {}).get('timer', None)
+                        timer_str = "Unknown"
+                        if last_frame is not None and hasattr(last_frame, 'id'):
+                            timer_str = frame_to_game_timer(last_frame.id, starting_timer_seconds)
+
+                        console_name = info.get('metadata', {}).get('consoleNick')
+                        if not console_name:
+                            base = os.path.basename(filepath)
+                            parts = base.rsplit('.', 2)
+                            if len(parts) == 3 and parts[2] == 'slp' and parts[1]:
+                                console_name = parts[1]
+
+                        game_info = {
+                            'stage_id': stage_id,
+                            'stage_name': stage_name,
+                            'players': players,
+                            'timer': timer_str,
+                            'console_name': console_name
+                        }
+                        # Look up SpectatorMode stream_id from nested structure
+                        console_stream_id = None
+                        if console_name:
+                            streams = MonitoringFTPHandler.console_streams.get(console_name)
+                            if streams:
+                                spec = streams.get('spectatormode')
+                                if spec:
+                                    console_stream_id = spec.get('stream_id')
+                        if console_stream_id:
+                            game_info['spectatormode_stream_id'] = console_stream_id
+                    else:
+                        game = read_slippi(filepath, skip_frames=False)
+
+                        if hasattr(game, 'start') and hasattr(game.start, 'stage'):
+                            stage_id = int(game.start.stage)
+                        if stage_id is not None:
+                            stage_name = STAGE_ID_MAP.get(stage_id, f"Stage {stage_id}")
+                            if game.start.is_frozen_ps and stage_name == "Pokémon Stadium":
+                                stage_name = "Frozen Pokémon Stadium"
+                        if hasattr(game, 'start') and hasattr(game.start, 'players'):
+                            player_ports = [player.port for player in game.start.players]
+                            min_port = min(player_ports)
+                            for p in game.start.players:
+                                char_id = int(p.character)
+                                costume = int(p.costume)
+                                char_name = CHARACTER_ID_MAP.get(char_id, f"char_{char_id}")
+                                port_key = 0 if p.port == min_port else 1
+                                stocks = game.frames.ports[port_key].leader.post.stocks[-1].as_py()
+                                percent = game.frames.ports[port_key].leader.post.percent[-1].as_py()
+                                icon = f"/icon/chara_2_{char_name}_{str(costume).zfill(2)}.png"
+                                players.append({
+                                    'port': port_to_number(p.port),
+                                    'character_id': char_id,
+                                    'character': char_name,
+                                    'costume': costume,
+                                    'stock_count': stocks,
+                                    'percent': percent,
+                                    'icon': icon
+                                })
+                        timer_str = "Unknown"
+                        frame_count = None
+                        try:
+                            last_frame = game.frames.id[-1].as_py()
+                            starting_timer_seconds = game.start.timer
+                            if last_frame is not None:
+                                frame_count = last_frame
+                                timer_str = frame_to_game_timer(last_frame, starting_timer_seconds)
+                        except Exception as e:
+                            timer_str = f"Error: {e}"
+                        game_info = {
+                            'stage_id': stage_id,
+                            'stage_name': stage_name,
+                            'players': players,
+                            'timer': timer_str,
+                            'frame_count': frame_count,
+                            'console_name': game.metadata['consoleNick']
+                        }
+                except Exception as e:
+                    game_info = {'error': str(e)}
+
+                if not is_active:
+                    gameinfo_cache[cache_key] = (stat_obj.st_mtime, game_info)
+
+            # Add Slippi Lab link if present
+            abs_fp = os.path.abspath(filepath)
+            slippilab_id = slippilab_uploaded.get(abs_fp)
+            if slippilab_id:
+                try:
+                    game_info['slippilab_id'] = slippilab_id
+                    game_info['slippilab_link'] = f"https://www.slippilab.com/{slippilab_id}"
+                except Exception:
+                    pass
+
+            replays.append({
+                'filename': filename,
+                'size_bytes': stat_obj.st_size,
+                'size_mb': size_mb,
+                'modified_time': modified_time,
+                'created_time': created_time,
+                'is_active_transfer': is_active,
+                'game_info': game_info
+            })
+
+    replays.sort(key=lambda x: x['filename'], reverse=True)
+    return {
+        'total_files': len(replays),
+        'active_transfers': len([r for r in replays if r['is_active_transfer']]),
+        'replays': replays
+    }
+
+def replays_snapshot_worker():
+    global replays_snapshot, replays_snapshot_mtime
+    while True:
+        try:
+            data = compute_replays_snapshot()
+            with replays_snapshot_lock:
+                replays_snapshot = data
+                replays_snapshot_mtime = time.time()
+        except Exception as e:
+            print(f"[WARN] Snapshot worker error: {e}", flush=True)
+        time.sleep(REPLAYS_SNAPSHOT_TTL)
+
 def main():
     # Check if port 21 is already in use
     import socket as pysocket
@@ -899,18 +1114,21 @@ def main():
     
     handler = MonitoringFTPHandler
     handler.authorizer = authorizer
-    # if PASSIVE_PORTS:
-    #     handler.passive_ports = PASSIVE_PORTS
-    #     print(f"NAT Configuration: Passive ports set to {PASSIVE_PORTS.start}-{PASSIVE_PORTS.stop-1}")
-    # if MASQUERADE_ADDRESS:
-    #     handler.masquerade_address = MASQUERADE_ADDRESS
-    #     print(f"NAT Configuration: Masquerade address set to {MASQUERADE_ADDRESS}")
-    # else:
-    #     print("NAT Configuration: No masquerade address set - you may need to configure this for NAT/gateway setups")
+    if PASSIVE_PORTS:
+        handler.passive_ports = PASSIVE_PORTS
+        print(f"NAT Configuration: Passive ports set to {PASSIVE_PORTS.start}-{PASSIVE_PORTS.stop-1}")
+    if MASQUERADE_ADDRESS:
+        handler.masquerade_address = MASQUERADE_ADDRESS
+        print(f"NAT Configuration: Masquerade address set to {MASQUERADE_ADDRESS}")
+    else:
+        print("NAT Configuration: No masquerade address set - you may need to configure this for NAT/gateway setups")
     upload_monitor_thread = threading.Thread(target=monitor_upload_directory, daemon=True)
     upload_monitor_thread.start()
     monitor_thread = threading.Thread(target=show_active_connections, daemon=True)
     monitor_thread.start()
+    # Start snapshot worker for /api/replays caching
+    snapshot_thread = threading.Thread(target=replays_snapshot_worker, daemon=True)
+    snapshot_thread.start()
     server = FTPServer(("0.0.0.0", 21), handler)
     print("FTP Server starting...")
     print("Port 21 - FTP uploads")
@@ -940,196 +1158,23 @@ if __name__ == "__main__":
 
     @app.route('/api/replays')
     def api_replays():
-        replays = []
-        active_filepaths = set()
-        # Simple in-memory cache: {filename: (mtime, game_info)}
-        if not hasattr(api_replays, "_gameinfo_cache"):
-            api_replays._gameinfo_cache = {}
-        gameinfo_cache = api_replays._gameinfo_cache
-
-
-        for conn in MonitoringFTPHandler.active_connections:
-            if conn.get('transfer_active') and conn.get('current_file'):
-                current_file = conn.get('current_file') or ''
-                if 'Uploading:' in current_file:
-                    filename = current_file.replace('Uploading:', '').strip()
-                    active_filepaths.add(os.path.abspath(filename))
-                elif 'Downloading:' in current_file:
-                    filename = current_file.replace('Downloading:', '').strip()
-                    active_filepaths.add(os.path.abspath(filename))
-        if os.path.exists(FTP_ROOT):
-            for filename in os.listdir(FTP_ROOT):
-                filepath = os.path.join(FTP_ROOT, filename)
-                if os.path.isfile(filepath) and filename.endswith('.slp'):
-                    stat = os.stat(filepath)
-                    size_mb = round(stat.st_size / (1024 * 1024), 2)
-                    modified_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))
-                    created_time = get_created_time_string(filename, filepath)
-                    is_active = os.path.abspath(filepath) in active_filepaths
-                    cache_key = filename
-                    cache_entry = gameinfo_cache.get(cache_key)
-                    # Only use cache if not actively transferring and mtime matches
-                    if (not is_active and cache_entry and cache_entry[0] == stat.st_mtime):
-                        game_info = cache_entry[1]
-                    else:
-                        stage_id = None
-                        stage_name = None
-                        players = []
-                        game_info = {}
-                        try:
-                            if is_active:
-                                info = live_slippi_info(filepath)
-                                frames = list(live_slippi_frame_numbers(filepath))
-                                last_frame = frames[-1] if frames else None
-                                # Stage info
-                                stage_id = int(info['start']['stage']) if info.get('start') and 'stage' in info['start'] else None
-                                stage_name = STAGE_ID_MAP.get(stage_id, f"Stage {stage_id}") if stage_id is not None else None
-                                if info.get('start', {}).get('is_frozen_ps', False) and stage_name == "Pokémon Stadium":
-                                    stage_name = "Frozen Pokémon Stadium"
-                                # Player info
-                                players = []
-                                player_list = info.get('start', {}).get('players', [])
-                                player_ports = [p['port'] for p in player_list] if player_list else []
-                                min_port = min(player_ports) if player_ports else 0
-                                # Get stocks for each player at last_frame if available
-                                for idx, p in enumerate(player_list):
-                                    char_id = int(p['character'])
-                                    costume = int(p['costume'])
-                                    char_name = CHARACTER_ID_MAP.get(char_id, f"char_{char_id}")
-                                    port_key = 0 if p['port'] == min_port else 1
-                                    stocks = None
-                                    percent = None
-                                    # Use last_frame's port data if available
-                                    try:
-                                        if last_frame is not None and hasattr(last_frame, 'ports') and len(last_frame.ports) > port_key:
-                                            port_data = last_frame.ports[port_key]
-                                            if hasattr(port_data, 'leader') and 'post' in port_data.leader and 'stocks' in port_data.leader['post']:
-                                                stocks = port_data.leader['post']['stocks']
-                                            if hasattr(port_data, 'leader') and 'post' in port_data.leader and 'percent' in port_data.leader['post']:
-                                                percent = port_data.leader['post']['percent']
-                                    except Exception:
-                                        stocks = None
-                                        percent = None
-                                    icon = f"/icon/chara_2_{char_name}_{str(costume).zfill(2)}.png"
-                                    players.append({
-                                        'port': port_to_number(p['port']),
-                                        'character_id': char_id,
-                                        'character': char_name,
-                                        'costume': costume,
-                                        'stock_count': stocks,
-                                        'percent': percent,
-                                        'icon': icon
-                                    })
-                                # Timer string
-                                starting_timer_seconds = info.get('start', {}).get('timer', None)
-                                timer_str = "Unknown"
-                                frame_count = None
-                                if last_frame is not None and hasattr(last_frame, 'id'):
-                                    frame_count = last_frame.id
-                                    timer_str = frame_to_game_timer(last_frame.id, starting_timer_seconds)
-                                # Console name
-                                console_name = info.get('metadata', {}).get('consoleNick')
-                                if not console_name:
-                                    # Try to extract from filename: Game_...<dot>console<dot>.slp
-                                    base = os.path.basename(filepath)
-                                    parts = base.rsplit('.', 2)
-                                    if len(parts) == 3 and parts[2] == 'slp' and parts[1]:
-                                        console_name = parts[1]
-                                game_info = {
-                                    'stage_id': stage_id,
-                                    'stage_name': stage_name,
-                                    'players': players,
-                                    'timer': timer_str,
-                                    'console_name': console_name
-                                }
-                                console_stream_id = None
-                                if console_name:
-                                    streams = MonitoringFTPHandler.console_streams.get(console_name)
-                                    if streams and 'stream_id' in streams:
-                                        console_stream_id = streams['stream_id']
-                                if console_stream_id:
-                                    game_info['spectatormode_stream_id'] = console_stream_id
-                            else:
-                                game = read_slippi(filepath, skip_frames=False)
-
-                                if hasattr(game, 'start') and hasattr(game.start, 'stage'):
-                                    stage_id = int(game.start.stage)
-                                if stage_id is not None:
-                                    stage_name = STAGE_ID_MAP.get(stage_id, f"Stage {stage_id}")
-                                    if game.start.is_frozen_ps and stage_name == "Pokémon Stadium":
-                                        stage_name = "Frozen Pokémon Stadium"
-                                if hasattr(game, 'start') and hasattr(game.start, 'players'):
-                                    # Determine the lowest and highest port among the players
-                                    player_ports = [player.port for player in game.start.players]
-                                    min_port = min(player_ports)
-                                    max_port = max(player_ports)
-                                    for p in game.start.players:
-                                        char_id = int(p.character)
-                                        costume = int(p.costume)
-                                        char_name = CHARACTER_ID_MAP.get(char_id, f"char_{char_id}")
-                                        # Use ports[0] if this is the lowest port, else ports[1]
-                                        if p.port == min_port:
-                                            port_key = 0
-                                        else:
-                                            port_key = 1
-                                        stocks = game.frames.ports[port_key].leader.post.stocks[-1].as_py()
-                                        percent = game.frames.ports[port_key].leader.post.percent[-1].as_py()
-                                        icon = f"/icon/chara_2_{char_name}_{str(costume).zfill(2)}.png"
-                                        players.append({
-                                            'port': port_to_number(p.port),
-                                            'character_id': char_id,
-                                            'character': char_name,
-                                            'costume': costume,
-                                            'stock_count': stocks,
-                                            'percent': percent,
-                                            'icon': icon
-                                        })
-                                # Calculate time remaining string
-                                timer_str = "Unknown"
-                                frame_count = None
-                                try:
-                                    last_frame = game.frames.id[-1].as_py()
-                                    starting_timer_seconds = game.start.timer
-                                    if last_frame is not None:
-                                        frame_count = last_frame
-                                        timer_str = frame_to_game_timer(last_frame, starting_timer_seconds)
-                                except Exception as e:
-                                    timer_str = f"Error: {e}"
-                                game_info = {
-                                    'stage_id': stage_id,
-                                    'stage_name': stage_name,
-                                    'players': players,
-                                    'timer': timer_str,
-                                    'frame_count': frame_count,
-                                    'console_name': game.metadata['consoleNick']
-                                }
-                        except Exception as e:
-                            game_info = {'error': str(e)}
-                        # Only cache if not actively transferring
-                        if not is_active:
-                            gameinfo_cache[cache_key] = (stat.st_mtime, game_info)
-                    # --- Add Slippi Lab ID if available ---
-                    abs_fp = os.path.abspath(filepath)
-                    slippilab_id = slippilab_uploaded.get(abs_fp)
-                    if slippilab_id:
-                        game_info['slippilab_id'] = slippilab_id
-                        game_info['slippilab_link'] = f"https://www.slippilab.com/{slippilab_id}"
-                    replays.append({
-                        'filename': filename,
-                        'size_bytes': stat.st_size,
-                        'size_mb': size_mb,
-                        'modified_time': modified_time,
-                        'created_time': created_time,
-                        'is_active_transfer': is_active,
-                        'game_info': game_info
-                    })
-        replays.sort(key=lambda x: x['filename'], reverse=True)
-        response_data = {
-            'total_files': len(replays),
-            'active_transfers': len([r for r in replays if r['is_active_transfer']]),
-            'replays': replays
-        }
-        return jsonify(response_data)
+        # Serve cached snapshot if available; build on-demand if not
+        global replays_snapshot, replays_snapshot_mtime
+        try:
+            with replays_snapshot_lock:
+                snapshot = replays_snapshot
+            if snapshot is None:
+                # First request, compute synchronously
+                snapshot = compute_replays_snapshot()
+                with replays_snapshot_lock:
+                    replays_snapshot = snapshot
+                    replays_snapshot_mtime = time.time()
+            resp = jsonify(snapshot)
+            # Hint to clients they can cache briefly
+            resp.headers['Cache-Control'] = 'public, max-age=1, must-revalidate'
+            return resp
+        except Exception as e:
+            return jsonify({'error': str(e), 'replays': [], 'total_files': 0, 'active_transfers': 0})
 
     @app.route('/icon/<path:filename>')
     def serve_icon(filename):
