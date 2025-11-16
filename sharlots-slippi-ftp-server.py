@@ -347,81 +347,106 @@ class MonitoringFTPHandler(FTPHandler):
             t = threading.Thread(target=self._spectatormode_persistent_stream, args=(console_name, file_queue, stop_event), daemon=True)
             MonitoringFTPHandler.console_streams[console_name]['spectatormode'] = {'thread': t, 'stop_event': stop_event, 'queue': file_queue}
             t.start()
-        MonitoringFTPHandler.console_streams[console_name]['queue'].put(abs_path)
+        MonitoringFTPHandler.console_streams[console_name]['spectatormode']['queue'].put(abs_path)
     def _spectatormode_persistent_stream(self, console_name, file_queue, stop_event):
         ws_url = WS_URL
         print(f"[SpectatorMode] Persistent thread started for console {console_name}", flush=True)
         async def stream_loop():
-            ws = None
-            stream_id = None
+            retry_file = None
             last_forwarded_file = None
-            try:
-                ws = await websockets.connect(ws_url, max_size=None)
-                print(f"[SpectatorMode] Connected to {ws_url} for console {console_name}", flush=True)
-                greeting = await ws.recv()
-                print(f"[SpectatorMode] Server greeting: {greeting}", flush=True)
-                msg = json.loads(greeting)
-                if "stream_ids" not in msg or not msg["stream_ids"]:
-                    print("[SpectatorMode] Error: No stream_ids in server greeting.")
-                    return
-                stream_id = msg["stream_ids"][0]
-                print(f"[SpectatorMode] Using stream_id: {stream_id}", flush=True)
-                # stream_id in the shared console_streams dict for access by main thread
-                MonitoringFTPHandler.console_streams[console_name]['spectatormode']['stream_id'] = stream_id
-                print(f"[SpectatorMode] Set MonitoringFTPHandler.console_streams['{console_name}']['spectatormode']['stream_id'] = {stream_id}", flush=True)
-                while not stop_event.is_set():
-                    print(f"[SpectatorMode] Waiting for next file for console {console_name} (queue size: {file_queue.qsize()})", flush=True)
-                    try:
-                        slp_path = file_queue.get(timeout=1)
-                        print(f"[SpectatorMode] Got file from queue for {console_name}: {slp_path}", flush=True)
-                    except queue.Empty:
-                        continue
-                    if last_forwarded_file == slp_path:
-                        print(f"[SpectatorMode] Duplicate file detected in queue for {console_name}: {slp_path}, skipping.", flush=True)
-                        continue
-                    last_forwarded_file = slp_path
-                    print(f"[SpectatorMode] Detected new SLP file for {console_name}: {slp_path}", flush=True)
-                    # Wait for file to exist and have nonzero size before starting streaming
-                    waited = 0
-                    while (not os.path.exists(slp_path) or os.path.getsize(slp_path) == 0) and waited < 60 and not stop_event.is_set():
-                        if not os.path.exists(slp_path):
-                            print(f"[SpectatorMode] Waiting for file to exist: {slp_path}", flush=True)
+            while not stop_event.is_set():
+                ws = None
+                stream_id = None
+                try:
+                    ws = await websockets.connect(ws_url, max_size=None)
+                    print(f"[SpectatorMode] Connected to {ws_url} for console {console_name}", flush=True)
+                    greeting = await ws.recv()
+                    print(f"[SpectatorMode] Server greeting: {greeting}", flush=True)
+                    msg = json.loads(greeting)
+                    if "stream_ids" not in msg or not msg["stream_ids"]:
+                        print("[SpectatorMode] Error: No stream_ids in server greeting.")
+                        return
+                    stream_id = msg["stream_ids"][0]
+                    print(f"[SpectatorMode] Using stream_id: {stream_id}", flush=True)# stream_id in the shared console_streams dict for access by main thread
+                    MonitoringFTPHandler.console_streams[console_name]['spectatormode']['stream_id'] = stream_id
+                    print(f"[SpectatorMode] Set MonitoringFTPHandler.console_streams['{console_name}']['spectatormode']['stream_id'] = {stream_id}", flush=True)
+                    while not stop_event.is_set():
+                        try:
+                            if retry_file is not None:
+                                slp_path = retry_file
+                                retrying = True
+                                retry_file = None
+                            else:
+                                print(f"[SpectatorMode] Waiting for next file for console {console_name} (queue size: {file_queue.qsize()})", flush=True)
+                                slp_path = file_queue.get(timeout=1)
+                                retrying = False
+                                print(f"[SpectatorMode] Got file from queue for {console_name}: {slp_path}", flush=True)
+                        except queue.Empty:
+                            continue
+
+                        if not retrying and last_forwarded_file == slp_path:
+                            print(f"[SpectatorMode] Duplicate file detected in queue for {console_name}: {slp_path}, skipping.", flush=True)
+                            continue
+                        last_forwarded_file = slp_path
+                        print(f"[SpectatorMode] Detected SLP file for {console_name}: {slp_path}", flush=True)
+                        # Wait for file to exist and have nonzero size before starting streaming
+                        waited = 0
+                        while (not os.path.exists(slp_path) or os.path.getsize(slp_path) == 0) and waited < 60 and not stop_event.is_set():
+                            if not os.path.exists(slp_path):
+                                print(f"[SpectatorMode] Waiting for file to exist: {slp_path}", flush=True)
+                                await asyncio.sleep(0.1)
+                                waited += 0.1
+                                continue
+                            print(f"[SpectatorMode] File exists but is empty: {slp_path}", flush=True)
                             await asyncio.sleep(0.1)
                             waited += 0.1
+                        if not os.path.exists(slp_path) or os.path.getsize(slp_path) == 0:
+                            print(f"[SpectatorMode] File did not appear or remained empty for streaming: {slp_path}", flush=True)
                             continue
-                        print(f"[SpectatorMode] File exists but is empty: {slp_path}", flush=True)
-                        await asyncio.sleep(0.1)
-                        waited += 0.1
-                    if not os.path.exists(slp_path) or os.path.getsize(slp_path) == 0:
-                        print(f"[SpectatorMode] File did not appear or remained empty for streaming: {slp_path}", flush=True)
-                        continue
-                    try:
-                        raw_offset, _ = find_raw_offset_and_length(slp_path)
-                        print(f"[SpectatorMode] Forwarding file {slp_path} (raw_offset={raw_offset})", flush=True)
-                        with open(slp_path, "rb") as f:
-                            sent_packets = 0
-                            for offset, packet in slp_packet_iterator(f, raw_offset, None):
-                                # print(f"[SpectatorMode] Sending packet at offset {offset} (len={len(packet)}) for {slp_path}", flush=True)
-                                header = struct.pack('<II', stream_id, len(packet))
-                                if packet and packet[0] == 0x39:
-                                    print("[SpectatorMode] Game End (0x39) event encountered. Stopping forwarding.", flush=True)
+
+                        try:
+                            raw_offset, _ = find_raw_offset_and_length(slp_path)
+                            print(f"[SpectatorMode] Forwarding file {slp_path} (raw_offset={raw_offset})", flush=True)
+                            with open(slp_path, "rb") as f:
+                                sent_packets = 0
+                                # If we're retrying after a dropped connection, resend from the beginning
+                                for offset, packet in slp_packet_iterator(f, raw_offset, None):
+                                    # print(f"[SpectatorMode] Sending packet at offset {offset} (len={len(packet)}) for {slp_path}", flush=True)
+                                    header = struct.pack('<II', stream_id, len(packet))
+                                    if packet and packet[0] == 0x39:
+                                        print("[SpectatorMode] Game End (0x39) event encountered. Stopping forwarding.", flush=True)
+                                        await ws.send(header + packet)
+                                        break
                                     await ws.send(header + packet)
-                                    break
-                                await ws.send(header + packet)
-                                sent_packets += 1
-                                await asyncio.sleep(0.001)
-                            print(f"[SpectatorMode] Finished forwarding {slp_path}, total packets sent: {sent_packets}", flush=True)
-                    except Exception as e:
-                        print(f"[SpectatorMode] Error forwarding {slp_path}: {e}", flush=True)
-            except Exception as e:
-                print(f"[SpectatorMode] Connection error for {console_name}: {e}", flush=True)
-            finally:
-                if ws is not None:
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
-                print(f"[SpectatorMode] WebSocket closed for console {console_name}", flush=True)
+                                    sent_packets += 1
+                                    await asyncio.sleep(0.001)
+                                print(f"[SpectatorMode] Finished forwarding {slp_path}, total packets sent: {sent_packets}", flush=True)
+                        except Exception as e:
+                            msg = str(e).lower()
+                            if (
+                                "no close frame received or sent" in msg
+                                or "no close frame received" in msg
+                                or "keepalive ping timeout" in msg
+                                or "code=1011" in msg
+                                or " 1011" in msg
+                            ):
+                                print(f"[SpectatorMode] Connection dropped while forwarding {slp_path}: {e}. Reconnecting and retrying...", flush=True)
+                                retry_file = slp_path
+                                break  # break inner loop to reconnect
+                            else:
+                                print(f"[SpectatorMode] Error forwarding {slp_path}: {e}", flush=True)
+                except Exception as e:
+                    print(f"[SpectatorMode] Connection error for {console_name}: {e}", flush=True)
+                finally:
+                    if ws is not None:
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                    print(f"[SpectatorMode] WebSocket closed for console {console_name}", flush=True)
+
+                if not stop_event.is_set():
+                    await asyncio.sleep(1)
         asyncio.run(stream_loop())
     active_connections = []
     active_transfers = []
@@ -560,6 +585,7 @@ class MonitoringFTPHandler(FTPHandler):
             return False
 
         async def persistent_stream_loop():
+            retry_file = None
             while not stop_event.is_set():
                 ws = None
                 try:
@@ -568,10 +594,16 @@ class MonitoringFTPHandler(FTPHandler):
                     print(f"[SLIPPITV] Connected to {ws_url}", flush=True)
                     while not stop_event.is_set():
                         try:
-                            filepath = file_queue.get(timeout=1)
+                            if retry_file is not None:
+                                filepath = retry_file
+                                retry_file = None
+                                is_retry = True
+                            else:
+                                filepath = file_queue.get(timeout=1)
+                                is_retry = False
                         except queue.Empty:
                             continue
-                        print(f"[SLIPPITV] Streaming file {filepath} on console {console_name}", flush=True)
+                        print(f"[SLIPPITV] Streaming file {filepath} on console {console_name}{' (retry)' if is_retry else ''}", flush=True)
                         last_pos = 0
                         # Wait for file to exist
                         waited = 0
@@ -599,7 +631,19 @@ class MonitoringFTPHandler(FTPHandler):
                         except FileNotFoundError:
                             print(f"[SLIPPITV] File not found: {filepath}", flush=True)
                         except Exception as e:
-                            print(f"[SLIPPITV] Error reading/sending file {filepath}: {e}", flush=True)
+                            msg = str(e).lower()
+                            if (
+                                "no close frame received or sent" in msg
+                                or "no close frame received" in msg
+                                or "keepalive ping timeout" in msg
+                                or "code=1011" in msg
+                                or " 1011" in msg
+                            ):
+                                print(f"[SLIPPITV] Connection dropped while sending {filepath}: {e}. Reconnecting and retrying...", flush=True)
+                                retry_file = filepath
+                                break  # break inner loop to reconnect and retry
+                            else:
+                                print(f"[SLIPPITV] Error reading/sending file {filepath}: {e}", flush=True)
                 except websockets.ConnectionClosed as e:
                     print(f"[SLIPPITV] Connection closed: code={getattr(e, 'code', None)}, reason={getattr(e, 'reason', None)}", flush=True)
                 except Exception as e:
