@@ -26,7 +26,11 @@ import csv
 app = Flask(__name__)
 
 # Configuration
-FTP_ROOT = "/web/sharlot/public_html/slp-files"
+try:
+    _BASE_DIR = Path(__file__).resolve().parent
+except Exception:
+    _BASE_DIR = Path.cwd()
+FTP_ROOT = str(_BASE_DIR / "ftp-files")
 
 # Ensure FTP directory exists
 os.makedirs(FTP_ROOT, exist_ok=True)
@@ -49,6 +53,148 @@ gameinfo_cache = {}
 replays_snapshot = None
 replays_snapshot_mtime = 0.0
 replays_snapshot_lock = threading.Lock()
+
+# --- Live/append activity tracking ---
+# Some clients upload via repeated APPE (append) calls with pauses. During pauses there may be
+# no active FTP data transfer, but the replay is still "live" and should be treated as active.
+LIVE_FILE_ACTIVE_GRACE_SECONDS = 120.0
+recent_file_activity = {}  # {abs_path: last_activity_epoch}
+recent_file_activity_lock = threading.Lock()
+
+# "Finalized" means: we observed the file to be quiet long enough to run
+# finalize actions (header fix + SlippiLab upload). For the API, this is a
+# stronger signal than the grace window and should mark the replay as finished.
+# If more data arrives (APPE bursts), the finalized flag is cleared.
+finalized_files = {}  # {abs_path: finalized_epoch}
+finalized_files_lock = threading.Lock()
+
+# "Finalize" actions (header fix + SlippiLab upload) should not run on every APPE burst.
+# We wait until the file has been quiet (no new activity) for a short window.
+FINALIZE_QUIET_SECONDS = 3.0
+finalize_timers = {}  # {abs_path: threading.Timer}
+finalize_timers_lock = threading.Lock()
+
+
+def mark_file_activity(path):
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        abs_path = path
+    try:
+        now = time.time()
+        with recent_file_activity_lock:
+            recent_file_activity[abs_path] = now
+        with finalized_files_lock:
+            # New activity means the file is no longer finalized.
+            finalized_files.pop(abs_path, None)
+    except Exception:
+        pass
+
+
+def mark_file_finalized(path):
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        abs_path = path
+    try:
+        with finalized_files_lock:
+            finalized_files[abs_path] = time.time()
+    except Exception:
+        pass
+
+
+def get_file_finalized_at(path):
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        abs_path = path
+    try:
+        with finalized_files_lock:
+            return finalized_files.get(abs_path)
+    except Exception:
+        return None
+
+
+def is_file_recently_active(path, grace_seconds=LIVE_FILE_ACTIVE_GRACE_SECONDS):
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        abs_path = path
+    try:
+        with recent_file_activity_lock:
+            last = recent_file_activity.get(abs_path)
+        return last is not None and (time.time() - last) <= grace_seconds
+    except Exception:
+        return False
+
+
+def get_last_file_activity(path):
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        abs_path = path
+    try:
+        with recent_file_activity_lock:
+            return recent_file_activity.get(abs_path)
+    except Exception:
+        return None
+
+
+def _finalize_slp_file(abs_path):
+    try:
+        if not abs_path or not abs_path.lower().endswith('.slp'):
+            return
+        if not os.path.exists(abs_path) or os.path.getsize(abs_path) == 0:
+            return
+
+        # Fix header length (best-effort)
+        fix_slp_header_length(abs_path)
+
+        # Upload to Slippi Lab if not already uploaded
+        if abs_path not in slippilab_uploaded:
+            replay_id = upload_to_slippilab(abs_path)
+            if replay_id:
+                slippilab_uploaded[abs_path] = replay_id
+                save_slippilab_uploaded()
+
+        # Mark finalized for API purposes (cleared automatically if more data arrives).
+        mark_file_finalized(abs_path)
+    except Exception as e:
+        print(f"[WARN] Finalize failed for {abs_path}: {e}", flush=True)
+
+
+def schedule_finalize_slp(path, quiet_seconds=FINALIZE_QUIET_SECONDS):
+    """Schedule finalization after the file has been quiet for quiet_seconds."""
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        abs_path = path
+    if not abs_path or not str(abs_path).lower().endswith('.slp'):
+        return
+
+    def _timer_cb(target):
+        try:
+            last = get_last_file_activity(target)
+            if last is not None and (time.time() - last) < quiet_seconds:
+                # Still active; reschedule.
+                schedule_finalize_slp(target, quiet_seconds=quiet_seconds)
+                return
+            _finalize_slp_file(target)
+        finally:
+            with finalize_timers_lock:
+                finalize_timers.pop(target, None)
+
+    with finalize_timers_lock:
+        old = finalize_timers.get(abs_path)
+        if old is not None:
+            try:
+                old.cancel()
+            except Exception:
+                pass
+        t = threading.Timer(quiet_seconds, _timer_cb, args=(abs_path,))
+        t.daemon = True
+        finalize_timers[abs_path] = t
+        t.start()
 
 def load_creation_times_csv(force=False):
     """Load and cache the optional creation_times.csv if present.
@@ -336,6 +482,9 @@ def frame_to_game_timer(frame, starting_timer_seconds=None):
 
 
 class MonitoringFTPHandler(FTPHandler):
+    slippitv_started_files = set()  # {(console_name, abs_path)} to avoid re-queueing same file
+    slippitv_started_files_lock = threading.Lock()
+
     def _start_spectatormode_stream(self, abs_path):
         if not abs_path.endswith('.slp'):
             return
@@ -355,15 +504,78 @@ class MonitoringFTPHandler(FTPHandler):
             MonitoringFTPHandler.console_streams[console_name]['spectatormode'] = {'thread': t, 'stop_event': stop_event, 'queue': file_queue}
             t.start()
         MonitoringFTPHandler.console_streams[console_name]['spectatormode']['queue'].put(abs_path)
+
+    def _get_console_name_from_path(self, abs_path):
+        base = os.path.basename(abs_path)
+        parts = base.rsplit('.', 2)
+        if len(parts) == 3 and parts[2] == 'slp' and parts[1]:
+            return parts[1]
+        return 'unknown'
+
+    def _resolve_target_fs_path(self, ftp_arg):
+        """Resolve an incoming STOR/APPE/RETR argument to a filesystem path.
+
+        Some clients send absolute Windows paths (e.g. 'K:\\...\\ftp-files\\Game.slp').
+        Treat those as just a filename and keep the write under FTP_ROOT.
+        """
+        s = (ftp_arg or '').strip()
+        if not s:
+            return s
+        try:
+            # Drive letter or UNC path
+            is_windows_abs = (
+                (len(s) >= 3 and s[1] == ':' and (s[2] == '\\' or s[2] == '/'))
+                or s.startswith('\\\\')
+            )
+            if is_windows_abs:
+                return os.path.abspath(os.path.join(FTP_ROOT, os.path.basename(s)))
+        except Exception:
+            pass
+
+        try:
+            return self.fs.ftp2fs(s)
+        except Exception:
+            return os.path.abspath(os.path.join(FTP_ROOT, os.path.basename(s)))
+
+    def _ensure_slippitv_stream(self, abs_path):
+        if not abs_path.endswith('.slp'):
+            return
+        console_name = self._get_console_name_from_path(abs_path)
+        if console_name not in MonitoringFTPHandler.console_streams:
+            MonitoringFTPHandler.console_streams[console_name] = {}
+        if 'slippitv' not in MonitoringFTPHandler.console_streams[console_name]:
+            print(f"[DEBUG] Starting SlippiTV streaming thread for console {console_name}", flush=True)
+            stop_event = threading.Event()
+            file_queue = queue.Queue()
+            t = threading.Thread(
+                target=self._stream_slp_to_slippitv_per_console,
+                args=(console_name, file_queue, stop_event),
+                daemon=True,
+            )
+            MonitoringFTPHandler.console_streams[console_name]['slippitv'] = {
+                'thread': t,
+                'stop_event': stop_event,
+                'queue': file_queue,
+            }
+            t.start()
+
+        key = (console_name, os.path.abspath(abs_path))
+        with MonitoringFTPHandler.slippitv_started_files_lock:
+            if key in MonitoringFTPHandler.slippitv_started_files:
+                return
+            MonitoringFTPHandler.slippitv_started_files.add(key)
+        MonitoringFTPHandler.console_streams[console_name]['slippitv']['queue'].put(abs_path)
     def _spectatormode_persistent_stream(self, console_name, file_queue, stop_event):
         ws_url = WS_URL
         print(f"[SpectatorMode] Persistent thread started for console {console_name}", flush=True)
         async def stream_loop():
             retry_file = None
             last_forwarded_file = None
+            INACTIVITY_TIMEOUT = 3600  # 1 hour in seconds
             while not stop_event.is_set():
                 ws = None
                 stream_id = None
+                last_activity_time = time.time()
                 try:
                     ws = await websockets.connect(ws_url, max_size=None)
                     print(f"[SpectatorMode] Connected to {ws_url} for console {console_name}", flush=True)
@@ -378,6 +590,10 @@ class MonitoringFTPHandler(FTPHandler):
                     MonitoringFTPHandler.console_streams[console_name]['spectatormode']['stream_id'] = stream_id
                     print(f"[SpectatorMode] Set MonitoringFTPHandler.console_streams['{console_name}']['spectatormode']['stream_id'] = {stream_id}", flush=True)
                     while not stop_event.is_set():
+                        # Check for inactivity timeout
+                        if time.time() - last_activity_time > INACTIVITY_TIMEOUT:
+                            print(f"[SpectatorMode] Closing connection for {console_name} due to 1 hour of inactivity", flush=True)
+                            break
                         try:
                             if retry_file is not None:
                                 slp_path = retry_file
@@ -395,6 +611,7 @@ class MonitoringFTPHandler(FTPHandler):
                             print(f"[SpectatorMode] Duplicate file detected in queue for {console_name}: {slp_path}, skipping.", flush=True)
                             continue
                         last_forwarded_file = slp_path
+                        last_activity_time = time.time()  # Update activity time when starting new file
                         print(f"[SpectatorMode] Detected SLP file for {console_name}: {slp_path}", flush=True)
                         # Wait for file to exist and have nonzero size before starting streaming
                         waited = 0
@@ -469,6 +686,7 @@ class MonitoringFTPHandler(FTPHandler):
             'connected_at': time.time(),
             'username': None,
             'current_file': None,
+            'current_filepath': None,
             'bytes_transferred': 0,
             'transfer_start_time': None,
             'data_socket': None,
@@ -477,17 +695,17 @@ class MonitoringFTPHandler(FTPHandler):
         }
         MonitoringFTPHandler.active_connections.append(connection_info)
         self.connection_info = connection_info
-        print(f"[{time.strftime('%H:%M:%S')}] Connection from {self.remote_ip}")
+        print(f"[{time.strftime('%H:%M:%S')}] Connection from {self.remote_ip}", flush=True)
         
     def on_disconnect(self):
         if hasattr(self, 'connection_info'):
-            print(f"[{time.strftime('%H:%M:%S')}] Disconnected: {self.connection_info['ip']}")
+            print(f"[{time.strftime('%H:%M:%S')}] Disconnected: {self.connection_info['ip']}", flush=True)
             MonitoringFTPHandler.active_connections.remove(self.connection_info)
             
     def on_login(self, username):
         if hasattr(self, 'connection_info'):
             self.connection_info['username'] = username
-            print(f"[{time.strftime('%H:%M:%S')}] Login: {username} from {self.connection_info['ip']}")
+            print(f"[{time.strftime('%H:%M:%S')}] Login: {username} from {self.connection_info['ip']}", flush=True)
     
     def on_file_sent(self, file):
         if hasattr(self, 'connection_info'):
@@ -495,7 +713,7 @@ class MonitoringFTPHandler(FTPHandler):
             self.connection_info['current_file'] = f"Sent: {os.path.basename(file)} ({file_size} bytes)"
             self.connection_info['bytes_transferred'] = file_size
             self.connection_info['transfer_active'] = False
-            print(f"[{time.strftime('%H:%M:%S')}] File sent: {os.path.basename(file)} ({file_size} bytes)")
+            print(f"[{time.strftime('%H:%M:%S')}] File sent: {os.path.basename(file)} ({file_size} bytes)", flush=True)
             
     def on_file_received(self, file):
         if hasattr(self, 'connection_info'):
@@ -504,45 +722,37 @@ class MonitoringFTPHandler(FTPHandler):
             self.connection_info['bytes_transferred'] = file_size
             self.connection_info['transfer_active'] = False
             print(f"[{time.strftime('%H:%M:%S')}] File received: {os.path.basename(file)} ({file_size} bytes)", flush=True)
+
+        # Treat this as activity (APPE uploads may complete in small bursts)
+        mark_file_activity(file)
+        schedule_finalize_slp(file)
         # fix SLP header length if this is a .slp file since it will always be 0 for reasons
-        if file.lower().endswith('.slp'):
-            fix_slp_header_length(file)
-        # Upload to Slippi Lab if not already uploaded
-        abs_path = os.path.abspath(file)
-        if abs_path.endswith('.slp') and abs_path not in slippilab_uploaded:
-            replay_id = upload_to_slippilab(abs_path)
-            if replay_id:
-                slippilab_uploaded[abs_path] = replay_id
-                save_slippilab_uploaded()
+        # NOTE: finalize actions are debounced via schedule_finalize_slp().
     
     # New methods to detect transfer start
-    def ftp_STOR(self, line):
+    # NOTE: pyftpdlib's ftp_APPE implementation calls ftp_STOR(file, mode="a"),
+    # so our override must accept the same signature.
+    def ftp_STOR(self, file, mode="w"):
         if hasattr(self, 'connection_info'):
-            filename = line.strip()
-            self.connection_info['current_file'] = f"Uploading: {filename}"
+            filename = (file or '').strip()
+            verb = "Appending" if str(mode).lower().startswith('a') else "Uploading"
+            print(f"[DEBUG] ftp_STOR called with filename: {filename} (mode={mode})", flush=True)
+            self.connection_info['current_file'] = f"{verb}: {filename}"
             self.connection_info['transfer_start_time'] = time.time()
             self.connection_info['transfer_active'] = True
             self.connection_info['bytes_transferred'] = 0
-            abs_path = os.path.abspath(filename)
+            abs_path = self._resolve_target_fs_path(filename)
+            self.connection_info['current_filepath'] = abs_path
+            mark_file_activity(abs_path)
             self._start_spectatormode_stream(abs_path)
-            base = os.path.basename(abs_path)
-            parts = base.rsplit('.', 2)
-            if len(parts) == 3 and parts[2] == 'slp' and parts[1]:
-                console_name = parts[1]
-            else:
-                console_name = 'unknown'
-            import queue
-            if console_name not in MonitoringFTPHandler.console_streams:
-                MonitoringFTPHandler.console_streams[console_name] = {}
-            if 'slippitv' not in MonitoringFTPHandler.console_streams[console_name]:
-                print(f"[DEBUG] Starting SlippiTV streaming thread for console {console_name}", flush=True)
-                stop_event = threading.Event()
-                file_queue = queue.Queue()
-                t = threading.Thread(target=self._stream_slp_to_slippitv_per_console, args=(console_name, file_queue, stop_event), daemon=True)
-                MonitoringFTPHandler.console_streams[console_name]['slippitv'] = {'thread': t, 'stop_event': stop_event, 'queue': file_queue}
-                t.start()
-            MonitoringFTPHandler.console_streams[console_name]['slippitv']['queue'].put(abs_path)
-        return super().ftp_STOR(line)
+            self._ensure_slippitv_stream(abs_path)
+        return super().ftp_STOR(file, mode=mode)
+
+    def ftp_APPE(self, file):
+        # Support APPE (append) uploads; delegate to ftp_STOR in append mode.
+        # Avoid calling super().ftp_APPE(), which would call ftp_STOR again.
+        print(f"[DEBUG] ftp_APPE called with filename: {(file or '').strip()}", flush=True)
+        return self.ftp_STOR(file, mode="a")
     
     def ftp_RETR(self, line):
         if hasattr(self, 'connection_info'):
@@ -551,7 +761,28 @@ class MonitoringFTPHandler(FTPHandler):
             self.connection_info['transfer_start_time'] = time.time()
             self.connection_info['transfer_active'] = True
             self.connection_info['bytes_transferred'] = 0
+            self.connection_info['current_filepath'] = self._resolve_target_fs_path(filename)
         return super().ftp_RETR(line)
+
+    def ftp_REST(self, line):
+        """Support the REST command (restart transfer) for resuming RETR/STOR.
+
+        pyftpdlib already implements this; we override only to ensure it remains
+        available alongside our custom STOR/APPE/RETR overrides, and to surface
+        the requested offset in logs/connection_info.
+        """
+        try:
+            marker = int(str(line).strip())
+        except Exception:
+            marker = None
+        if hasattr(self, 'connection_info'):
+            try:
+                self.connection_info['restart_position'] = marker
+                if marker is not None:
+                    print(f"[DEBUG] ftp_REST called (restart_position={marker})", flush=True)
+            except Exception:
+                pass
+        return super().ftp_REST(line)
     
     # Override data connection methods
     def data_channel(self):
@@ -586,20 +817,35 @@ class MonitoringFTPHandler(FTPHandler):
         def is_transfer_active(filepath):
             abs_path = os.path.abspath(filepath)
             for conn in MonitoringFTPHandler.active_connections:
-                current_file = conn.get('current_file')
-                if current_file and abs_path in current_file and conn.get('transfer_active'):
-                    return True
-            return False
+                if not conn.get('transfer_active'):
+                    continue
+                fp = conn.get('current_filepath')
+                if not fp:
+                    continue
+                try:
+                    if os.path.abspath(fp) == abs_path:
+                        return True
+                except Exception:
+                    if fp == abs_path:
+                        return True
+            # Also treat recently appended files as active (APPE bursts)
+            return is_file_recently_active(abs_path)
 
         async def persistent_stream_loop():
             retry_file = None
+            INACTIVITY_TIMEOUT = 3600  # 1 hour in seconds
             while not stop_event.is_set():
                 ws = None
+                last_activity_time = time.time()
                 try:
                     print(f"[SLIPPITV] Connecting to {ws_url} for console {console_name}", flush=True)
                     ws = await websockets.connect(ws_url, max_size=None)
                     print(f"[SLIPPITV] Connected to {ws_url}", flush=True)
                     while not stop_event.is_set():
+                        # Check for inactivity timeout
+                        if time.time() - last_activity_time > INACTIVITY_TIMEOUT:
+                            print(f"[SLIPPITV] Closing connection for {console_name} due to 1 hour of inactivity", flush=True)
+                            break
                         try:
                             if retry_file is not None:
                                 filepath = retry_file
@@ -610,9 +856,9 @@ class MonitoringFTPHandler(FTPHandler):
                                 is_retry = False
                         except queue.Empty:
                             continue
+                        last_activity_time = time.time()  # Update activity time when starting new file
                         print(f"[SLIPPITV] Streaming file {filepath} on console {console_name}{' (retry)' if is_retry else ''}", flush=True)
                         last_pos = 0
-                        # Wait for file to exist
                         waited = 0
                         while not os.path.exists(filepath) and not stop_event.is_set():
                             if waited % 10 == 0:
@@ -632,7 +878,7 @@ class MonitoringFTPHandler(FTPHandler):
                                         last_pos += len(chunk)
                                     else:
                                         if not is_transfer_active(filepath):
-                                            print(f"[SLIPPITV] Finished streaming file {filepath} (FTP transfer ended)", flush=True)
+                                            print(f"[SLIPPITV] Finished streaming file {filepath} (FTP transfer ended / inactive)", flush=True)
                                             break
                                         await asyncio.sleep(0.2)
                         except FileNotFoundError:
@@ -740,10 +986,10 @@ STAGE_ID_MAP = {
 
 # NAT Configuration - Set your public IP address here
 # You can get your public IP from https://www.whatismyip.com/
-# MASQUERADE_ADDRESS = "118.67.199.230"  # Set this to your public IP address (e.g., "123.456.789.012")
+MASQUERADE_ADDRESS = "118.67.199.230"  # Set this to your public IP address (e.g., "123.456.789.012")
 
 # Passive port range for data connections
-# PASSIVE_PORTS = range(64739, 64840)  # Ports 64739-64839
+PASSIVE_PORTS = range(64739, 64840)  # Ports 64739-64839
 
 def frame_to_game_timer(frame, starting_timer_seconds=None):
     """
@@ -772,8 +1018,8 @@ def get_socket_info():
             if not conn.laddr:
                 continue
                 
-            # FTP control connections (port 21)
-            if conn.laddr.port == 21:
+            # FTP control connections (port 2121)
+            if conn.laddr.port == 2121:
                 ftp_connections.append({
                     'fd': getattr(conn, 'fd', 'N/A'),
                     'local_addr': f"{conn.laddr.ip}:{conn.laddr.port}",
@@ -813,7 +1059,7 @@ def get_simple_socket_info():
             lines = result.stdout.split('\n')
             ftp_sockets = []
             for line in lines:
-                if ':21 ' in line or (any(ip in line for ip in [conn['ip'] for conn in MonitoringFTPHandler.active_connections])):
+                if ':2121 ' in line or (any(ip in line for ip in [conn['ip'] for conn in MonitoringFTPHandler.active_connections])):
                     ftp_sockets.append(line.strip())
             return ftp_sockets
     except:
@@ -841,11 +1087,25 @@ def monitor_upload_directory():
                 for filename, info in current_files.items():
                     is_growing = filename in last_files and info['size'] > last_files[filename]['size']
                     if is_growing:
+                        # Any growth counts as activity (helps APPE burst uploads)
+                        try:
+                            mark_file_activity(os.path.join(FTP_ROOT, filename))
+                        except Exception:
+                            pass
                         # File is growing - active transfer
+                        abs_path = os.path.abspath(os.path.join(FTP_ROOT, filename))
                         for conn in MonitoringFTPHandler.active_connections:
-                            if conn.get('current_file') and filename in conn['current_file']:
-                                conn['bytes_transferred'] = info['size']
-                                conn['transfer_active'] = True
+                            fp = conn.get('current_filepath')
+                            if not fp:
+                                continue
+                            try:
+                                if os.path.abspath(fp) == abs_path:
+                                    conn['bytes_transferred'] = info['size']
+                                    conn['transfer_active'] = True
+                            except Exception:
+                                if fp == abs_path:
+                                    conn['bytes_transferred'] = info['size']
+                                    conn['transfer_active'] = True
                 last_files = current_files.copy()
         except Exception as e:
             pass  # Ignore errors
@@ -861,7 +1121,12 @@ def show_active_connections():
                 current_file = conn.get('current_file')
                 if current_file is None:
                     current_file = ''
-                current_file = current_file.replace('Uploading: ', '').replace('Downloading: ', '') or 'connected'
+                current_file = (
+                    current_file
+                    .replace('Uploading: ', '')
+                    .replace('Appending: ', '')
+                    .replace('Downloading: ', '')
+                ) or 'connected'
                 # Only log when status changes or files change
                 if not hasattr(conn, 'last_logged_status') or conn.get('last_logged_status') != (status, current_file):
                     print(f"[{time.strftime('%H:%M:%S')}] {conn['ip']} - {status} - {current_file}")
@@ -892,14 +1157,13 @@ def compute_replays_snapshot():
 
     # Build set of active filepaths
     for conn in MonitoringFTPHandler.active_connections:
-        if conn.get('transfer_active') and conn.get('current_file'):
-            current_file = conn.get('current_file') or ''
-            if 'Uploading:' in current_file:
-                filename = current_file.replace('Uploading:', '').strip()
-                active_filepaths.add(os.path.abspath(filename))
-            elif 'Downloading:' in current_file:
-                filename = current_file.replace('Downloading:', '').strip()
-                active_filepaths.add(os.path.abspath(filename))
+        if conn.get('transfer_active'):
+            fp = conn.get('current_filepath')
+            if fp:
+                try:
+                    active_filepaths.add(os.path.abspath(fp))
+                except Exception:
+                    active_filepaths.add(fp)
 
     if os.path.exists(FTP_ROOT):
         for filename in os.listdir(FTP_ROOT):
@@ -913,7 +1177,19 @@ def compute_replays_snapshot():
             size_mb = round(stat_obj.st_size / (1024 * 1024), 2)
             modified_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_obj.st_mtime))
             created_time = get_created_time_string(filename, filepath)
-            is_active = os.path.abspath(filepath) in active_filepaths
+            abs_fp = os.path.abspath(filepath)
+            is_active = abs_fp in active_filepaths or is_file_recently_active(abs_fp)
+
+            # If finalize ran and there has been no newer activity since, treat as finished.
+            # This avoids keeping replays "active" for the full grace period after the last APPE.
+            finalized_at = get_file_finalized_at(abs_fp)
+            if finalized_at:
+                try:
+                    last_act = get_last_file_activity(abs_fp)
+                except Exception:
+                    last_act = None
+                if (last_act is None or last_act <= finalized_at) and stat_obj.st_mtime <= finalized_at:
+                    is_active = False
 
             cache_key = filename
             cache_entry = gameinfo_cache.get(cache_key)
@@ -1055,7 +1331,6 @@ def compute_replays_snapshot():
                     gameinfo_cache[cache_key] = (stat_obj.st_mtime, game_info)
 
             # Add Slippi Lab link if present
-            abs_fp = os.path.abspath(filepath)
             slippilab_id = slippilab_uploaded.get(abs_fp)
             if slippilab_id:
                 try:
@@ -1094,14 +1369,14 @@ def replays_snapshot_worker():
         time.sleep(REPLAYS_SNAPSHOT_TTL)
 
 def main():
-    # Check if port 21 is already in use
+    # Check if port 2121 is already in use
     import socket as pysocket
     sock = pysocket.socket(pysocket.AF_INET, pysocket.SOCK_STREAM)
     try:
-        sock.bind(("0.0.0.0", 21))
+        sock.bind(("0.0.0.0", 2121))
         sock.close()
     except OSError:
-        print("[ERROR] Port 21 is already in use. FTP server will not start.")
+        print("[ERROR] Port 2121 is already in use. FTP server will not start.")
         return
     # Set up FTP server
     authorizer = DummyAuthorizer()
@@ -1129,9 +1404,9 @@ def main():
     # Start snapshot worker for /api/replays caching
     snapshot_thread = threading.Thread(target=replays_snapshot_worker, daemon=True)
     snapshot_thread.start()
-    server = FTPServer(("0.0.0.0", 21), handler)
+    server = FTPServer(("0.0.0.0", 2121), handler)
     print("FTP Server starting...")
-    print("Port 21 - FTP uploads")
+    print("Port 2121 - FTP uploads")
     print("Port 9876 - Web interface")
     try:
         server.serve_forever()
@@ -1144,12 +1419,19 @@ if __name__ == "__main__":
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.WARNING)
 
-    # Start FTP server in a background thread, but only call main() once
-    ftp_thread = threading.Thread(target=main, daemon=True)
-    ftp_thread.start()
+    DEBUG = True
+    USE_RELOADER = True
+
+    # When Flask reloader is enabled, the parent process should NOT start
+    # background threads (it will spawn the child which runs the app).
+    # Start FTP + snapshot worker only in the reloader child.
+    is_reloader_child = (os.environ.get("WERKZEUG_RUN_MAIN") == "true")
+    if (not USE_RELOADER) or is_reloader_child:
+        ftp_thread = threading.Thread(target=main, daemon=True)
+        ftp_thread.start()
         
     load_slippilab_uploaded()
-    batch_upload_missing_to_slippilab()
+    # batch_upload_missing_to_slippilab()
 
     # Flask web server
     @app.route('/')
@@ -1158,13 +1440,17 @@ if __name__ == "__main__":
 
     @app.route('/api/replays')
     def api_replays():
-        # Serve cached snapshot if available; build on-demand if not
+        # Serve cached snapshot; refresh on TTL or build on-demand
         global replays_snapshot, replays_snapshot_mtime
         try:
             with replays_snapshot_lock:
                 snapshot = replays_snapshot
-            if snapshot is None:
-                # First request, compute synchronously
+                snap_mtime = replays_snapshot_mtime
+
+            is_stale = (snapshot is None) or ((time.time() - (snap_mtime or 0.0)) > REPLAYS_SNAPSHOT_TTL)
+            if is_stale:
+                # Compute synchronously (also covers cases where the snapshot
+                # worker thread isn't running, e.g. under Flask reloader).
                 snapshot = compute_replays_snapshot()
                 with replays_snapshot_lock:
                     replays_snapshot = snapshot
@@ -1183,4 +1469,4 @@ if __name__ == "__main__":
     def serve_assets(filename):
         return send_from_directory('assets', filename)
 
-    app.run(host='0.0.0.0', port=9876, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=9876, debug=DEBUG, use_reloader=USE_RELOADER)
