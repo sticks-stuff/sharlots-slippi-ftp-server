@@ -117,12 +117,28 @@
             font-style: italic;
             opacity: 0.5;
         }
+        .date-header {
+            background: #dde;
+            font-weight: bold;
+            padding: 4px 8px;
+            width: 100%;
+            text-align: left;
+            border-top: 3px solid black;
+            border-left: 2px solid black;
+            border-right: 2px solid black;
+        }
     </style>
 </head>
 
 <body>
     <h1>sharlots Slippi FTP Server</h1>
-    <button id="exportReplayManagerBtn">Export selected to <img alt="Replay Manager" src="/assets/replay-manager.png" width="18" height="18"> Replay Manager</button>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+        <button id="exportReplayManagerBtn">Export selected to <img alt="Replay Manager" src="/assets/replay-manager.png" width="18" height="18"> Replay Manager</button>
+        <label style="display:inline-flex;gap:6px;align-items:center;">
+            <input type="checkbox" id="debugModeToggle">
+            Debug mode
+        </label>
+    </div>
     <table id="fileList"></table>
     <table id="errorFileList"></table>
     <br>
@@ -273,10 +289,28 @@
                     'none': 'None'
                 };
                 let timerHtml = '';
-                if (replay.game_info.timer && replay.game_info.timer !== 'Unknown') {
-                    timerHtml = `<div><b><span class='timer-value' id='timer-${timerKey}'>${replay.game_info.timer}</span></b></div>`;
-                    if (isActive) {
+                if (isActive) {
+                    // For live games, show remaining timer and keep ticking
+                    if (replay.game_info.timer && replay.game_info.timer !== 'Unknown') {
+                        timerHtml = `<div><b><span class='timer-value' id='timer-${timerKey}'>${replay.game_info.timer}</span></b></div>`;
                         setTimeout(() => startTimerTicker(timerKey, replay.game_info.timer), 0);
+                    }
+                } else {
+                    // For finished games, display actual duration (derived from frame_count) instead of final in-game timer state
+                    if (typeof replay.game_info.frame_count === 'number' && replay.game_info.frame_count > 0) {
+                        const frames = replay.game_info.frame_count;
+                        function framesToDuration(fr) {
+                            const minutes = Math.floor(fr / 3600);
+                            const seconds = Math.floor((fr % 3600) / 60);
+                            const leftoverFrames = fr % 60;
+                            const centiseconds = Math.floor(leftoverFrames * 100 / 60); // scale frames to centiseconds
+                            return `${minutes.toString().padStart(2,'0')}:${seconds.toString().padStart(2,'0')}.${centiseconds.toString().padStart(2,'0')}`;
+                        }
+                        const durationStr = framesToDuration(frames);
+                        timerHtml = `<div><b><span class='timer-value' id='timer-${timerKey}'>${durationStr}</span></b></div>`;
+                    } else if (replay.game_info.timer && replay.game_info.timer !== 'Unknown') {
+                        // Fallback if frame_count missing
+                        timerHtml = `<div><b><span class='timer-value' id='timer-${timerKey}'>${replay.game_info.timer}</span></b></div>`;
                     }
                 }
                 if (isActive) {
@@ -319,19 +353,31 @@
             const replayUrl = `https://sharlot.memes.nz/slp-files/${replay.filename}`;
             let checkboxHtml = `<input type="checkbox" class="replay-checkbox" id="${checkboxId}" data-url="${replayUrl}" style="margin-right:6px;vertical-align:middle;">`;
             const rowId = getReplayRowId(replay);
+            let fileInfoInner = '';
+            if (debugMode) {
+                // Original rich details: date, size, filename (with checkbox before name)
+                fileInfoInner = `
+                    <span class="last-modified">${dateStr}</span>
+                    <span class="file-size"><code>${sizeStr}</code></span>
+                    <span class="display-name">
+                        ${checkboxHtml}
+                        ${isActive ? '<span style="color:#d00;font-size:1.2em;vertical-align:middle;">🔴</span> ' : ''}
+                        <a href="https://sharlot.memes.nz/slp-files/${replay.filename}">${replay.filename}</a>
+                        ${isActive ? ' <span style="color:#d00;font-weight:bold;">(live)</span>' : ''}
+                    </span>
+                `;
+            } else {
+                // Minimal details: checkbox moved left of date, hide filename and size
+                fileInfoInner = `
+                    <span class="last-modified">${checkboxHtml}${isActive ? '<span style="color:#d00;font-size:1.2em;vertical-align:middle;">🔴</span> ' : ''}${dateStr}${isActive ? ' <span style="color:#d00;font-weight:bold;">(live)</span>' : ''}</span>
+                `;
+            }
             return `
                 <tr class="${className}" style="background:${rowBg}" id="${rowId}">
                     <td>
                         <div class="file-info">
-                            <span class="last-modified">${dateStr}</span>
-                            <span class="file-size"><code>${sizeStr}</code></span>
-                            <span class="display-name">
-                                ${checkboxHtml}
-                                ${isActive ? '<span style="color:#d00;font-size:1.2em;vertical-align:middle;">🔴</span> ' : ''}
-                                <a href="https://sharlot.memes.nz/slp-files/${replay.filename}">${replay.filename}</a>
-                                ${isActive ? ' <span style="color:#d00;font-weight:bold;">(live)</span>' : ''}
-                            </span>
-                            ${watchOptionsHtml}              
+                            ${fileInfoInner}
+                            ${watchOptionsHtml}
                         </div>
                     </td>
                     <td class="game-info">
@@ -381,6 +427,21 @@
 
 
         let lastReplayData = null;
+        let expandedSets = {}; // key: `${consoleName}::${clusterIdx}` or `unknown::0`
+        let forceRerender = false;
+        let debugMode = false; // controls filename/size visibility and checkbox placement
+        // Track per-set stats to detect new live games and auto-expand
+        let setStats = {}; // key -> { count: number, top: string|null }
+
+        const debugToggle = document.getElementById('debugModeToggle');
+        if (debugToggle) {
+            debugMode = !!debugToggle.checked; // default unchecked
+            debugToggle.addEventListener('change', () => {
+                debugMode = !!debugToggle.checked;
+                forceRerender = true;
+                loadReplays();
+            });
+        }
         function deepEqual(a, b) {
             if (a === b) return true;
             if (typeof a !== typeof b) return false;
@@ -400,13 +461,21 @@
             return 'replay-row-' + replay.filename.replace(/[^a-zA-Z0-9_\-]/g, '_');
         }
 
+        function formatDateHeaderText(d) {
+            const day = d.getDate().toString().padStart(2, '0');
+            const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sept','Oct','Nov','Dec'];
+            const month = monthNames[d.getMonth()];
+            const year = d.getFullYear();
+            return `${day} ${month} ${year}`;
+        }
+
         async function loadReplays() {
             const prevChecked = getCheckedReplayUrls();
             try {
                 const response = await fetch('/api/replays');
                 const data = await response.json();
                 // Only update if data actually changed
-                if (lastReplayData && deepEqual(data, lastReplayData)) {
+                if (!forceRerender && lastReplayData && deepEqual(data, lastReplayData)) {
                     // Only update timer values for live games
                     document.querySelectorAll('.timer-value').forEach(el => {
                         const id = el.id;
@@ -417,6 +486,7 @@
                     return;
                 }
                 lastReplayData = JSON.parse(JSON.stringify(data));
+                forceRerender = false;
                 const listEl = document.getElementById('fileList');
                 const errorListEl = document.getElementById('errorFileList');
                 if (data.replays.length === 0) {
@@ -601,8 +671,19 @@
                     const clusters = clusterReplays(replays);
                     html += `<tbody>`;
                     html += `<tr><td colspan='2' style='background:#eee;font-weight:bold;font-size:1.1em;width: 100%;'>Console: ${consoleName}</td></tr>`;
+                    let previousDateKey = null;
                     for (let clusterIdx = 0; clusterIdx < clusters.length; ++clusterIdx) {
                         const cluster = clusters[clusterIdx];
+                        // Insert day divider when the day changes
+                        let clusterDate = null;
+                        if (cluster.replays && cluster.replays.length > 0) {
+                            clusterDate = new Date(cluster.replays[0].created_time);
+                        }
+                        const dateKey = clusterDate ? formatDateHeaderText(clusterDate) : null;
+                        if (dateKey && dateKey !== previousDateKey) {
+                            html += `<tr><td colspan='2' class='date-header'>${dateKey}</td></tr>`;
+                            previousDateKey = dateKey;
+                        }
                         let playerChars = [[], []];
                         let seenChars = [new Set(), new Set()];
                         for (const replay of cluster.replays) {
@@ -633,37 +714,180 @@
                         // Add export set button
                         const setReplayUrls = cluster.replays.map(r => `https://sharlot.memes.nz/slp-files/${r.filename}`).join(';');
                         const setExportBtnId = `export-set-btn-${consoleName.replace(/[^a-zA-Z0-9_\-]/g, '_')}-${clusterIdx}`;
+                        // Compute total time for the set
+                        let earliestCreated = null;
+                        let latestModified = null;
+                        for (const r of cluster.replays) {
+                            const c = new Date(r.created_time);
+                            const m = new Date(r.modified_time);
+                            if (!earliestCreated || c < earliestCreated) earliestCreated = c;
+                            if (!latestModified || m > latestModified) latestModified = m;
+                        }
+                        let totalMs = 0;
+                        if (earliestCreated && latestModified) totalMs = Math.max(0, latestModified - earliestCreated);
+                        function formatDuration(ms) {
+                            const sec = Math.floor(ms / 1000);
+                            const h = Math.floor(sec / 3600);
+                            const m = Math.floor((sec % 3600) / 60);
+                            const s = sec % 60;
+                            const hh = h > 0 ? (h.toString().padStart(2, '0') + ':') : '';
+                            return `${hh}${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+                        }
+                        const totalStr = formatDuration(totalMs);
+                        // Per-set expand/collapse state
+                        const setId = `${consoleName}::${clusterIdx}`;
+                        // Detect if a new game has been added to this set and is live; if so, auto-expand
+                        const currentCount = cluster.replays.length;
+                        const currentTopReplay = cluster.replays[0] || null; // newest first
+                        const currentTopFilename = currentTopReplay ? currentTopReplay.filename : null;
+                        const currentTopIsLive = currentTopReplay ? !!currentTopReplay.is_active_transfer : false;
+                        let autoExpand = false;
+                        if (setStats[setId]) {
+                            const prev = setStats[setId];
+                            if ((currentCount > prev.count || (currentTopFilename && currentTopFilename !== prev.top)) && currentTopIsLive) {
+                                autoExpand = true;
+                            }
+                        }
+                        // Update stats snapshot for next render
+                        setStats[setId] = { count: currentCount, top: currentTopFilename };
+                        if (expandedSets[setId] === undefined) {
+                            const hasLive = cluster.replays.some(r => r.is_active_transfer);
+                            expandedSets[setId] = !!hasLive; // default collapsed unless live
+                        }
+                        if (autoExpand) {
+                            expandedSets[setId] = true;
+                        }
+                        const isExpanded = !!expandedSets[setId];
+                        const toggleSymbol = isExpanded ? '▼' : '▶';
                         html += `<tr><td colspan='2' class='set-header' style='display:flex;align-items:center;justify-content:space-between;'>
-                            <span>Score: ${scoreDisplay}</span>
-                            <button class="export-set-btn" id="${setExportBtnId}" data-urls="${setReplayUrls}" style="margin-left:8px;">Export Set to <img alt="Replay Manager" src="/assets/replay-manager.png" width="18" height="18"> Replay Manager</button>
+                            <span style="display:flex;align-items:center;gap:8px;">
+                                <button class="set-toggle-btn" data-set-id="${setId}" style="cursor:pointer;">${toggleSymbol}</button>
+                                <span>${scoreDisplay}</span>
+                            </span>
+                            <span style="display:flex;align-items:center;gap:8px;">
+                                <span>${totalStr}</span>
+                                <button class="export-set-btn" id="${setExportBtnId}" data-urls="${setReplayUrls}" style="margin-left:8px;"><img alt="Replay Manager" src="/assets/replay-manager.png" width="18" height="18">Report</button>
+                            </span>
                         </td></tr>`;
-                        for (let i = 0; i < cluster.replays.length; ++i) {
-                            const replay = cluster.replays[i];
-                            const isLast = i === cluster.replays.length - 1;
-                            html += renderReplayRow(replay, rowIdx, isLast);
-                            allReplayIds.add(getReplayRowId(replay));
-                            rowIdx++;
+                        if (isExpanded) {
+                            for (let i = 0; i < cluster.replays.length; ++i) {
+                                const replay = cluster.replays[i];
+                                const isLast = i === cluster.replays.length - 1;
+                                html += renderReplayRow(replay, rowIdx, isLast);
+                                allReplayIds.add(getReplayRowId(replay));
+                                rowIdx++;
+                            }
                         }
                     }
                     html += `</tbody>`;
                 }
                 listEl.innerHTML = html;
-                // For Unknown Console, wrap replays in a single cluster if any
+                // For Unknown Console, group replays by day with a divider header
                 let errorHtml = '';
                 let errorRowIdx = 0;
                 if (invalidConsoleGroup.length > 0) {
-                    const errorClusters = [{ replays: invalidConsoleGroup, score: [0, 0] }];
-                    for (const cluster of errorClusters) {
-                        errorHtml += `<tbody><tr><td colspan='2' style='background:#eee;font-weight:bold;font-size:1.1em;width: 100%;'>Console: Unknown Console</td></tr>`;
-                        for (let i = 0; i < cluster.replays.length; ++i) {
-                            const replay = cluster.replays[i];
-                            errorHtml += renderReplayRow(replay, i, i === cluster.replays.length - 1);
-                            allReplayIds.add(getReplayRowId(replay));
-                        }
-                        errorHtml += `</tbody>`;
+                    // Build day groups from invalidConsoleGroup (which is already newest-first)
+                    errorHtml += `<tbody><tr><td colspan='2' style='background:#eee;font-weight:bold;font-size:1.1em;width: 100%;'>Console: Unknown Console</td></tr>`;
+                    let prevDayKey = null;
+                    // Map of dayKey -> array of replays
+                    const groupsByDay = [];
+                    const tmpMap = new Map();
+                    for (const r of invalidConsoleGroup) {
+                        const d = new Date(r.created_time);
+                        const k = formatDateHeaderText(d);
+                        if (!tmpMap.has(k)) tmpMap.set(k, []);
+                        tmpMap.get(k).push(r);
                     }
+                    // Preserve newest-first order based on first occurrence in invalidConsoleGroup
+                    for (const r of invalidConsoleGroup) {
+                        const k = formatDateHeaderText(new Date(r.created_time));
+                        if (!groupsByDay.find(e => e.key === k)) groupsByDay.push({ key: k, replays: tmpMap.get(k) });
+                    }
+                    for (let gi = 0; gi < groupsByDay.length; gi++) {
+                        const dayGroup = groupsByDay[gi];
+                        // Date divider header
+                        errorHtml += `<tr><td colspan='2' class='date-header'>${dayGroup.key}</td></tr>`;
+                        // Summarize this day's unknown-console replays into a pseudo-set with toggle
+                        let earliestCreated = null;
+                        let latestModified = null;
+                        let playerChars = [[], []];
+                        let seenChars = [new Set(), new Set()];
+                        for (const r of dayGroup.replays) {
+                            const c = new Date(r.created_time);
+                            const m = new Date(r.modified_time);
+                            if (!earliestCreated || c < earliestCreated) earliestCreated = c;
+                            if (!latestModified || m > latestModified) latestModified = m;
+                            if (r.game_info && r.game_info.players && r.game_info.players.length >= 2) {
+                                for (let p = 0; p < 2; ++p) {
+                                    const char = r.game_info.players[p].character;
+                                    const icon = r.game_info.players[p].icon;
+                                    if (char && !seenChars[p].has(char)) {
+                                        seenChars[p].add(char);
+                                        playerChars[p].push({icon, name: char});
+                                    }
+                                }
+                            }
+                        }
+                        function renderIcons(arr) { return arr.map(pc => `<img class='stock-icon-img' src='${pc.icon}' alt='${pc.name}'>`).join(' '); }
+                        const leftIcons = renderIcons(playerChars[0]);
+                        const rightIcons = renderIcons(playerChars[1]);
+                        let totalMs = 0; if (earliestCreated && latestModified) totalMs = Math.max(0, latestModified - earliestCreated);
+                        function formatDuration(ms) {
+                            const sec = Math.floor(ms / 1000);
+                            const h = Math.floor(sec / 3600);
+                            const m = Math.floor((sec % 3600) / 60);
+                            const s = sec % 60;
+                            const hh = h > 0 ? (h.toString().padStart(2, '0') + ':') : '';
+                            return `${hh}${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+                        }
+                        const totalStr = formatDuration(totalMs);
+                        const count = dayGroup.replays.length;
+                        const summary = `Set: ${count} game${count!==1?'s':''} • Total: ${totalStr} • Players: ${leftIcons} vs ${rightIcons}`;
+                        const setReplayUrls = dayGroup.replays.map(r => `https://sharlot.memes.nz/slp-files/${r.filename}`).join(';');
+                        const setExportBtnId = `export-set-btn-unknown-${gi}`;
+                        const setId = `unknown::${dayGroup.key.replace(/[^a-zA-Z0-9_\-]/g, '_')}`;
+                        // Detect if a new game has been added to this day-group and the newest is live; if so, auto-expand
+                        const currentCount = dayGroup.replays.length;
+                        const currentTopReplay = dayGroup.replays[0] || null; // newest first
+                        const currentTopFilename = currentTopReplay ? currentTopReplay.filename : null;
+                        const currentTopIsLive = currentTopReplay ? !!currentTopReplay.is_active_transfer : false;
+                        let autoExpand = false;
+                        if (setStats[setId]) {
+                            const prev = setStats[setId];
+                            if ((currentCount > prev.count || (currentTopFilename && currentTopFilename !== prev.top)) && currentTopIsLive) {
+                                autoExpand = true;
+                            }
+                        }
+                        // Update stats snapshot for next render
+                        setStats[setId] = { count: currentCount, top: currentTopFilename };
+                        if (expandedSets[setId] === undefined) {
+                            const hasLive = dayGroup.replays.some(r => r.is_active_transfer);
+                            expandedSets[setId] = !!hasLive;
+                        }
+                        if (autoExpand) {
+                            expandedSets[setId] = true;
+                        }
+                        const isExpanded = !!expandedSets[setId];
+                        const toggleSymbol = isExpanded ? '▼' : '▶';
+                        errorHtml += `<tr><td colspan='2' class='set-header' style='display:flex;align-items:center;justify-content:space-between;'>
+                            <span style="display:flex;align-items:center;gap:8px;">
+                                <button class="set-toggle-btn" data-set-id="${setId}" style="cursor:pointer;">${toggleSymbol}</button>
+                                <span>${summary}</span>
+                            </span>
+                            <button class=\"export-set-btn\" id=\"${setExportBtnId}\" data-urls=\"${setReplayUrls}\" style=\"margin-left:8px;\"><img alt=\"Replay Manager\" src=\"/assets/replay-manager.png\" width=\"18\" height=\"18\">Report</button>
+                        </td></tr>`;
+                        if (isExpanded) {
+                            for (let i = 0; i < dayGroup.replays.length; ++i) {
+                                const replay = dayGroup.replays[i];
+                                errorHtml += renderReplayRow(replay, i, i === dayGroup.replays.length - 1);
+                                allReplayIds.add(getReplayRowId(replay));
+                            }
+                        }
+                    }
+                    errorHtml += `</tbody>`;
                 }
                 errorListEl.innerHTML = errorHtml;
+                // Restore any previously checked replay selections in expanded sets
                 restoreCheckedReplayUrls(prevChecked);
 
                 document.querySelectorAll('.export-set-btn').forEach(btn => {
@@ -675,6 +899,16 @@
                         e.stopPropagation();
                     });
                 });
+                // Wire up per-set toggle buttons
+                document.querySelectorAll('.set-toggle-btn').forEach(btn => {
+                    btn.addEventListener('click', function(e) {
+                        const setId = btn.getAttribute('data-set-id');
+                        expandedSets[setId] = !expandedSets[setId];
+                        forceRerender = true;
+                        loadReplays();
+                        e.stopPropagation();
+                    });
+                });
             } catch (error) {
                 console.error('Failed to load replays:', error);
                 document.getElementById('fileList').innerHTML = '<tr><td colspan="6">Error loading files</td></tr>';
@@ -682,6 +916,7 @@
         }
         loadReplays();
         setInterval(loadReplays, 1000);
+        // No global toggle; sets are controlled individually via buttons
     </script>
 </body>
 

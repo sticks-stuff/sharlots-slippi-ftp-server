@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Login</title>
+  </head>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 16px;">
+    {% if not disc %}
+      <h2>Login with start.gg</h2>
+      <a href="{{ url_for('oauth_redirect') }}">Login</a>
+    {% else %}
+      <h2>start.gg</h2>
+      <div>Username: <b>{{ name }}</b></div>
+      <div>Discriminator: <b>{{ disc }}</b></div>
+      <div style="margin-top: 12px;">Current scan sound: <b>{{ current_sound or 'None' }}</b></div>
+
+      <form method="post" style="margin-top: 12px;">
+        <label for="sound">Sound:</label>
+        <select id="sound" name="sound">
+          {% for s in sounds %}
+            <option value="{{ s }}" {% if s == current_sound %}selected{% endif %}>{{ s }}</option>
+          {% endfor %}
+        </select>
+        <button type="button" id="preview">Preview</button>
+        <button type="submit">Submit</button>
+      </form>
+
+      <audio id="player" preload="none"></audio>
+
+      <script>
+        (function () {
+          const sel = document.getElementById('sound');
+          const btn = document.getElementById('preview');
+          const player = document.getElementById('player');
+          btn.addEventListener('click', () => {
+            const v = sel.value;
+            if (!v) return;
+            player.src = '/sounds/' + encodeURIComponent(v);
+            player.currentTime = 0;
+            player.play();
+          });
+        })();
+      </script>
+    {% endif %}
+  </body>
+</html>

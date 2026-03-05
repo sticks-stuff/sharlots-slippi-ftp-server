@@ -1,0 +1,17 @@
+{
+  "enabled": false,
+  "api_url": "https://api.start.gg/gql/alpha",
+  "token": "PUT_YOUR_STARTGG_TOKEN_HERE",
+
+  "oauth_client_id": "PUT_YOUR_STARTGG_OAUTH_CLIENT_ID_HERE",
+  "oauth_client_secret": "PUT_YOUR_STARTGG_OAUTH_CLIENT_SECRET_HERE",
+  "oauth_redirect_uri": "",
+  "oauth_scopes": "user.identity",
+
+  "event_slug": "tournament/test-tournament-please-ignore-18/event/melee-singles",
+
+  "set_wins_to_finish": 3,
+  "http_timeout_seconds": 10,
+  "report_character_color": false,
+  "replay_manager_js_path": "../replay-manager-for-slippi/dist/cli/cli/replay-manager.js"
+}

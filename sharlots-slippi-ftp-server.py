@@ -4,7 +4,7 @@ import time
 import threading
 import socket
 import psutil
-from flask import Flask, render_template, render_template_string, jsonify, send_from_directory
+from flask import Flask, render_template, jsonify, send_from_directory, request, redirect, session, url_for, Response
 from peppi_py import read_slippi, live_slippi_frame_numbers, live_slippi_info
 import pyarrow as pa
 import asyncio
@@ -18,6 +18,8 @@ import json
 import requests
 import subprocess
 import shutil
+import secrets
+import base64
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
@@ -29,6 +31,7 @@ import csv
 import re
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
 
 # Configuration
 try:
@@ -86,6 +89,9 @@ finalize_timers_lock = threading.Lock()
 #   card_reader_Game_... .Jamie.de85e4b4.195e7c0f.slp
 STARTGG_CONFIG_PATH = str(_BASE_DIR / "startgg_config.json")
 REPLAY_ZIPS_DIR = str(_BASE_DIR / "replay-zips")
+SCAN_SOUNDS_DIR = str(_BASE_DIR / "scan-sounds")
+SOUND_PREFS_CSV = str(_BASE_DIR / "scan_sound_prefs.csv")
+_sound_prefs_lock = threading.Lock()
 
 # Default location for replay-manager-for-slippi (sibling folder by default)
 _DEFAULT_REPLAY_MANAGER_JS_PATH = str(
@@ -119,6 +125,18 @@ def _cfg_get(key, default=None):
 STARTGG_API_URL = str(_cfg_get("api_url", "https://api.start.gg/gql/alpha"))
 STARTGG_TOKEN = _cfg_get("token")
 STARTGG_EVENT_SLUG = _cfg_get("event_slug")
+
+# start.gg OAuth (for /login)
+STARTGG_OAUTH_CLIENT_ID = str(_cfg_get("oauth_client_id", "") or "").strip()
+STARTGG_OAUTH_CLIENT_SECRET = str(_cfg_get("oauth_client_secret", "") or "").strip()
+STARTGG_OAUTH_REDIRECT_URI = str(_cfg_get("oauth_redirect_uri", "") or "").strip()
+STARTGG_OAUTH_SCOPES = str(_cfg_get("oauth_scopes", "user.identity") or "user.identity").strip()
+STARTGG_OAUTH_AUTHORIZE_URL = str(
+    _cfg_get("oauth_authorize_url", "https://start.gg/oauth/authorize") or "https://start.gg/oauth/authorize"
+).strip()
+STARTGG_OAUTH_TOKEN_URL = str(
+    _cfg_get("oauth_token_url", "https://api.start.gg/oauth/access_token") or "https://api.start.gg/oauth/access_token"
+).strip()
 
 # If config file doesn't exist / is empty, default to disabled.
 STARTGG_ENABLED = bool(_cfg_get("enabled", bool(STARTGG_CONFIG)))
@@ -289,6 +307,341 @@ def _startgg_graphql(query, variables=None):
     if isinstance(data, dict) and data.get("errors"):
         raise RuntimeError(f"start.gg GraphQL errors: {data.get('errors')}")
     return data.get("data")
+
+
+def _startgg_graphql_with_token(token, query, variables=None):
+    """GraphQL call with a specific bearer token (used for OAuth sessions)."""
+    if not token:
+        raise RuntimeError("missing token")
+    payload = {"query": query, "variables": variables or {}}
+    resp = requests.post(
+        STARTGG_API_URL,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        json=payload,
+        timeout=STARTGG_HTTP_TIMEOUT_SECONDS,
+    )
+    data = resp.json() if resp.content else {}
+    if not resp.ok:
+        raise RuntimeError(f"start.gg HTTP {resp.status_code}: {data}")
+    if isinstance(data, dict) and data.get("errors"):
+        raise RuntimeError(f"start.gg GraphQL errors: {data.get('errors')}")
+    return data.get("data")
+
+
+def _startgg_oauth_get_identity(access_token):
+    """Return (discriminator, display_name) for the logged-in user."""
+    # Current schema (as provided): Query.currentUser -> User
+    # User fields include discriminator, name, slug, player { gamerTag }
+    queries = [
+        """
+        query Me {
+          currentUser {
+            discriminator
+            name
+            slug
+            player { gamerTag }
+          }
+        }
+        """,
+    ]
+    last_err = None
+    for q in queries:
+        try:
+            d = _startgg_graphql_with_token(access_token, q, {})
+            u = (d or {}).get("currentUser") if isinstance(d, dict) else None
+            if not isinstance(u, dict):
+                continue
+            disc = u.get("discriminator")
+            player = u.get("player") if isinstance(u.get("player"), dict) else None
+            name = None
+            if player and player.get("gamerTag"):
+                name = player.get("gamerTag")
+            if not name:
+                name = u.get("name") or u.get("slug") or disc
+            if disc:
+                return str(disc), str(name) if name else str(disc)
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Failed to fetch start.gg identity via OAuth token: {last_err}")
+
+
+def _list_scan_sounds():
+    """Return list of available sound filenames."""
+    try:
+        os.makedirs(SCAN_SOUNDS_DIR, exist_ok=True)
+    except Exception:
+        pass
+    exts = {".wav", ".mp3", ".ogg"}
+    out = []
+    try:
+        for name in os.listdir(SCAN_SOUNDS_DIR):
+            p = os.path.join(SCAN_SOUNDS_DIR, name)
+            if not os.path.isfile(p):
+                continue
+            if os.path.splitext(name)[1].lower() in exts:
+                out.append(name)
+    except Exception:
+        return []
+    out.sort(key=lambda s: s.lower())
+    return out
+
+
+def _read_sound_prefs():
+    prefs = {}
+    if not os.path.exists(SOUND_PREFS_CSV):
+        return prefs
+    try:
+        with open(SOUND_PREFS_CSV, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                disc = (row.get("startgg_discriminator") or "").strip().lower()
+                snd = (row.get("sound") or "").strip()
+                if disc:
+                    prefs[disc] = snd
+    except Exception:
+        return prefs
+    return prefs
+
+
+def _write_sound_pref(discriminator, sound_filename):
+    disc = (discriminator or "").strip().lower()
+    snd = (sound_filename or "").strip()
+    if not disc:
+        return
+    prefs = _read_sound_prefs()
+    prefs[disc] = snd
+    tmp_path = SOUND_PREFS_CSV + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["startgg_discriminator", "sound"])
+        for k in sorted(prefs.keys()):
+            w.writerow([k, prefs[k]])
+    os.replace(tmp_path, SOUND_PREFS_CSV)
+
+
+@app.get("/api/sound/<discriminator>")
+def api_get_sound(discriminator):
+    disc = (discriminator or "").strip().lower()
+    if not disc:
+        return Response("", status=400, mimetype="text/plain")
+    with _sound_prefs_lock:
+        prefs = _read_sound_prefs()
+    val = prefs.get(disc, "")
+    if not val:
+        return Response("", status=404, mimetype="text/plain")
+    return Response(val, mimetype="text/plain")
+
+
+@app.get("/sounds/<path:filename>")
+def get_sound_file(filename):
+    # Only allow serving by basename from SCAN_SOUNDS_DIR.
+    name = os.path.basename(filename or "")
+    if not name:
+        return Response("", status=404)
+    return send_from_directory(SCAN_SOUNDS_DIR, name)
+
+
+@app.get("/oauth_redirect")
+def oauth_redirect():
+    if not STARTGG_OAUTH_CLIENT_ID or not STARTGG_OAUTH_CLIENT_SECRET:
+        return Response("start.gg OAuth not configured (oauth_client_id/oauth_client_secret)", status=500)
+    redirect_uri = STARTGG_OAUTH_REDIRECT_URI or (request.url_root.rstrip("/") + url_for("oauth_callback"))
+    state = secrets.token_urlsafe(16)
+    session["oauth_state"] = state
+    params = {
+        "response_type": "code",
+        "client_id": STARTGG_OAUTH_CLIENT_ID,
+        "scope": STARTGG_OAUTH_SCOPES,
+        "redirect_uri": redirect_uri
+    }
+    # Note: client_secret should NOT be in the authorize URL (example in prompt included it, but it's not needed).
+    return redirect(STARTGG_OAUTH_AUTHORIZE_URL.rstrip("?") + "?" + urllib.parse.urlencode(params))
+
+
+@app.get("/oauth")
+def oauth_callback():
+    code = (request.args.get("code") or "").strip()
+    state = (request.args.get("state") or "").strip()
+    if not code:
+        return Response("OAuth login failed: missing code", status=400)
+    expected_state = session.get("oauth_state")
+    if expected_state and state and state != expected_state:
+        return Response("OAuth login failed: invalid state", status=400)
+
+    redirect_uri = STARTGG_OAUTH_REDIRECT_URI or (request.url_root.rstrip("/") + url_for("oauth_callback"))
+    if not STARTGG_OAUTH_CLIENT_ID or not STARTGG_OAUTH_CLIENT_SECRET:
+        return Response("start.gg OAuth not configured (oauth_client_id/oauth_client_secret)", status=500)
+
+    data = {
+        "client_id": STARTGG_OAUTH_CLIENT_ID,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "scope": STARTGG_OAUTH_SCOPES,
+    }
+
+    def _parse_oauth_token_response(r):
+        raw_text = ""
+        try:
+            raw_text = r.text or ""
+        except Exception:
+            raw_text = ""
+
+        # If the server returns a quoted error string (e.g. "Client authentication failed "),
+        # keep it readable.
+        raw_stripped = raw_text.strip()
+        if len(raw_stripped) >= 2 and raw_stripped[0] == '"' and raw_stripped[-1] == '"':
+            try:
+                raw_text = json.loads(raw_stripped)
+            except Exception:
+                pass
+
+        parsed = None
+        try:
+            parsed = r.json() if r.content else None
+        except Exception:
+            parsed = None
+
+        # Some servers return JSON-encoded strings.
+        if isinstance(parsed, str):
+            try:
+                parsed2 = json.loads(parsed)
+                parsed = parsed2
+            except Exception:
+                pass
+
+        if isinstance(parsed, dict):
+            return parsed
+
+        # Some OAuth servers return x-www-form-urlencoded.
+        try:
+            # Only treat it like a querystring if it actually looks like one.
+            if "=" not in raw_text:
+                raise ValueError("not a querystring")
+            qs = urllib.parse.parse_qs(raw_text, keep_blank_values=True)
+            if qs:
+                flat = {}
+                for k, v in qs.items():
+                    if isinstance(v, list):
+                        flat[k] = v[0] if v else ""
+                    else:
+                        flat[k] = v
+                return flat
+        except Exception:
+            pass
+
+        # Last resort: maybe raw text is a JSON object.
+        try:
+            parsed3 = json.loads(raw_text)
+            if isinstance(parsed3, dict):
+                return parsed3
+        except Exception:
+            pass
+
+        return {"_raw": raw_text}
+
+    def _coerce_client_id(val):
+        # start.gg examples often use a numeric client_id.
+        try:
+            s = str(val).strip()
+        except Exception:
+            return val
+        if s.isdigit():
+            try:
+                return int(s)
+            except Exception:
+                return s
+        return s
+
+    token_url = STARTGG_OAUTH_TOKEN_URL
+    json_body = dict(data)
+    json_body["client_id"] = _coerce_client_id(json_body.get("client_id"))
+    json_body["client_secret"] = STARTGG_OAUTH_CLIENT_SECRET
+
+    # JS-style: JSON body with client_id + client_secret.
+    resp = requests.post(
+        token_url,
+        json=json_body,
+        headers={"Content-Type": "application/json"},
+        timeout=STARTGG_HTTP_TIMEOUT_SECONDS,
+    )
+    tok = _parse_oauth_token_response(resp)
+
+    if not resp.ok or not isinstance(tok, dict) or not tok.get("access_token"):
+        # Fallback: form-encoded body with client_secret.
+        form_body = dict(data)
+        form_body["client_id"] = str(form_body.get("client_id") or "")
+        form_body["client_secret"] = STARTGG_OAUTH_CLIENT_SECRET
+        resp2 = requests.post(
+            token_url,
+            data=form_body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=STARTGG_HTTP_TIMEOUT_SECONDS,
+        )
+        tok = _parse_oauth_token_response(resp2)
+        if not resp2.ok or not isinstance(tok, dict) or not tok.get("access_token"):
+            # Last resort: Basic auth + form body (some OAuth servers require this).
+            basic = base64.b64encode(
+                f"{STARTGG_OAUTH_CLIENT_ID}:{STARTGG_OAUTH_CLIENT_SECRET}".encode("utf-8")
+            ).decode("ascii")
+            resp3 = requests.post(
+                token_url,
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": f"Basic {basic}",
+                },
+                timeout=STARTGG_HTTP_TIMEOUT_SECONDS,
+            )
+            tok = _parse_oauth_token_response(resp3)
+            if not resp3.ok or not isinstance(tok, dict) or not tok.get("access_token"):
+                return Response(
+                    f"OAuth token exchange failed ({resp.status_code}/{resp2.status_code}/{resp3.status_code}): {tok}",
+                    status=500,
+                )
+
+    access_token = tok.get("access_token") if isinstance(tok, dict) else None
+    if not access_token:
+        return Response("OAuth token exchange failed: missing access_token", status=500)
+
+    # Fetch identity and store in session
+    disc, name = _startgg_oauth_get_identity(access_token)
+    session["startgg_access_token"] = access_token
+    session["startgg_discriminator"] = disc
+    session["startgg_display_name"] = name
+    session.pop("oauth_state", None)
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    disc = session.get("startgg_discriminator")
+    name = session.get("startgg_display_name")
+
+    if request.method == "POST":
+        if not disc:
+            return redirect(url_for("login"))
+        sound = (request.form.get("sound") or "").strip()
+        available = set(_list_scan_sounds())
+        if sound and sound in available:
+            with _sound_prefs_lock:
+                _write_sound_pref(disc, sound)
+        return redirect(url_for("login"))
+
+    sounds = _list_scan_sounds()
+    current_sound = ""
+    if disc:
+        with _sound_prefs_lock:
+            current_sound = _read_sound_prefs().get(str(disc).lower(), "")
+
+    return render_template(
+        "login.html",
+        disc=disc,
+        name=name,
+        sounds=sounds,
+        current_sound=current_sound,
+    )
 
 
 def _startgg_get_event_id():
@@ -1069,9 +1422,10 @@ def _card_reader_worker_loop():
                                             # Use start.gg slot order for replay-manager left/right
                                             left_rm = entrant1_disc
                                             right_rm = entrant2_disc
+                                            event_id_val = _startgg_get_event_id()
                                             t = threading.Thread(
                                                 target=_run_replay_manager_for_set,
-                                                args=(str(event_id), str(set_id), left_rm, right_rm, replay_paths),
+                                                args=(str(event_id_val), str(set_id), left_rm, right_rm, replay_paths),
                                                 daemon=True,
                                             )
                                             t.start()
