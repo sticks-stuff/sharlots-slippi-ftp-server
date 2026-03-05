@@ -16,12 +16,17 @@ from pathlib import Path
 import glob
 import json
 import requests
+import subprocess
+import shutil
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
 import urllib.parse
 from statx import statx
 import csv
+
+# --- start.gg (GraphQL) integration for card_reader_*.slp ---
+import re
 
 app = Flask(__name__)
 
@@ -74,6 +79,1121 @@ FINALIZE_QUIET_SECONDS = 3.0
 finalize_timers = {}  # {abs_path: threading.Timer}
 finalize_timers_lock = threading.Lock()
 
+# --- card_reader -> start.gg reporting ---
+# Expected filename format:
+#   card_reader_<anything>.<console>.<left_disc>.<right_disc>.slp
+# Example:
+#   card_reader_Game_... .Jamie.de85e4b4.195e7c0f.slp
+STARTGG_CONFIG_PATH = str(_BASE_DIR / "startgg_config.json")
+REPLAY_ZIPS_DIR = str(_BASE_DIR / "replay-zips")
+
+# Default location for replay-manager-for-slippi (sibling folder by default)
+_DEFAULT_REPLAY_MANAGER_JS_PATH = str(
+    (_BASE_DIR.parent / "replay-manager-for-slippi" / "dist" / "cli" / "cli" / "replay-manager.js")
+)
+
+
+def _load_startgg_config():
+    """Load start.gg config from startgg_config.json (returns dict, never raises)."""
+    if not os.path.exists(STARTGG_CONFIG_PATH):
+        return {}
+    try:
+        with open(STARTGG_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception as e:
+        print(f"[STARTGG] Failed to load {STARTGG_CONFIG_PATH}: {e}", flush=True)
+        return {}
+
+
+STARTGG_CONFIG = _load_startgg_config()
+
+
+def _cfg_get(key, default=None):
+    try:
+        return STARTGG_CONFIG.get(key, default)
+    except Exception:
+        return default
+
+
+STARTGG_API_URL = str(_cfg_get("api_url", "https://api.start.gg/gql/alpha"))
+STARTGG_TOKEN = _cfg_get("token")
+STARTGG_EVENT_SLUG = _cfg_get("event_slug")
+
+# If config file doesn't exist / is empty, default to disabled.
+STARTGG_ENABLED = bool(_cfg_get("enabled", bool(STARTGG_CONFIG)))
+
+# Best-of-5 (first to 3 wins) per your request
+try:
+    STARTGG_SET_WINS_TO_FINISH = int(_cfg_get("set_wins_to_finish", 3))
+except Exception:
+    STARTGG_SET_WINS_TO_FINISH = 3
+
+try:
+    STARTGG_HTTP_TIMEOUT_SECONDS = float(_cfg_get("http_timeout_seconds", 10))
+except Exception:
+    STARTGG_HTTP_TIMEOUT_SECONDS = 10.0
+
+# If enabled, encode costume index into the "stocks remaining" field per Replay Manager spec:
+# (<costume_index> + 1) * 100 + <actual_stocks_remaining>
+STARTGG_REPORT_CHARACTER_COLOR = bool(_cfg_get("report_character_color", False))
+
+# replay-manager-for-slippi integration
+REPLAY_MANAGER_JS_PATH = str(_cfg_get("replay_manager_js_path", _DEFAULT_REPLAY_MANAGER_JS_PATH) or "").strip()
+
+# Default mapping from Slippi stage id -> start.gg stage id (melee ruleset).
+STARTGG_STAGE_ID_MAP = {
+    8: "5",    # Yoshi's Story
+    2: "11",   # Fountain of Dreams
+    3: "15",   # Pokémon Stadium
+    31: "19",  # Battlefield
+    32: "20",  # Final Destination
+    28: "25",  # Dream Land (N64)
+}
+
+
+# Slippi character id -> start.gg character id (Melee)
+SLIPPI_CHAR_TO_STARTGG_ID = {
+    0x05: "1",   # Bowser
+    0x00: "2",   # Captain Falcon
+    0x01: "3",   # Donkey Kong
+    0x16: "4",   # Dr. Mario
+    0x14: "5",   # Falco
+    0x02: "6",   # Fox
+    0x19: "7",   # Ganondorf
+    0x0E: "8",   # Ice Climbers
+    0x0F: "9",   # Jigglypuff
+    0x04: "10",  # Kirby
+    0x06: "11",  # Link
+    0x07: "12",  # Luigi
+    0x08: "13",  # Mario
+    0x09: "14",  # Marth
+    0x0A: "15",  # Mewtwo
+    0x03: "16",  # Mr. Game & Watch
+    0x0B: "17",  # Ness
+    0x0C: "18",  # Peach
+    0x18: "19",  # Pichu
+    0x0D: "20",  # Pikachu
+    0x17: "21",  # Roy
+    0x10: "22",  # Samus
+    0x13: "23",  # Sheik
+    0x11: "24",  # Yoshi
+    0x15: "25",  # Young Link
+    0x12: "26",  # Zelda
+}
+
+
+def _startgg_stage_payload_id(stage_id):
+    if stage_id is None:
+        return None
+    try:
+        mapped = STARTGG_STAGE_ID_MAP.get(int(stage_id))
+        return str(mapped) if mapped is not None else str(int(stage_id))
+    except Exception:
+        return None
+
+
+def _startgg_character_payload_id(slippi_char_id):
+    if slippi_char_id is None:
+        return None
+    try:
+        return SLIPPI_CHAR_TO_STARTGG_ID.get(int(slippi_char_id))
+    except Exception:
+        return None
+
+
+def _startgg_encode_stocks_with_costume(stocks_remaining, costume_index):
+    if not STARTGG_REPORT_CHARACTER_COLOR:
+        return stocks_remaining
+    if stocks_remaining is None or costume_index is None:
+        return stocks_remaining
+    try:
+        s = int(stocks_remaining)
+        c = int(costume_index)
+        return (c + 1) * 100 + s
+    except Exception:
+        return stocks_remaining
+
+# start.gg caches
+_startgg_cache_lock = threading.Lock()
+_startgg_event_id_cache = None  # (slug, event_id, fetched_at)
+_startgg_sets_cache = None  # (event_id, sets_list, fetched_at)
+_startgg_set_games_cache = {}  # {set_id: (max_order_num, fetched_at)}
+
+# card_reader runtime state
+_card_reader_lock = threading.Lock()
+_card_reader_seen_files = set()  # {abs_path}
+_card_reader_queue = queue.Queue()
+_card_reader_games = {}  # {abs_path: game_ctx}
+_card_reader_sets = {}  # {(event_id, set_id): set_ctx}
+
+_CARD_READER_FILENAME_RE = re.compile(
+    r"^(?P<prefix>card_reader_.*)\.(?P<console>[^.]+)\.(?P<left>[0-9a-fA-F]{4,})\.(?P<right>[0-9a-fA-F]{4,})\.slp$",
+    re.IGNORECASE,
+)
+
+
+def _parse_card_reader_filename(path):
+    base = os.path.basename(path or "")
+    m = _CARD_READER_FILENAME_RE.match(base)
+    if not m:
+        return None
+    return {
+        "console": m.group("console"),
+        "left_disc": m.group("left").lower(),
+        "right_disc": m.group("right").lower(),
+        "filename": base,
+    }
+
+
+def _console_name_from_slp_path(path):
+    """Best-effort console name extraction from an .slp path.
+
+    Supports both:
+    - card_reader_<anything>.<console>.<left_disc>.<right_disc>.slp
+    - <anything>.<console>.slp (legacy behavior)
+    """
+    parsed = _parse_card_reader_filename(path)
+    if parsed and parsed.get("console"):
+        return parsed["console"]
+
+    base = os.path.basename(path or "")
+    parts = base.rsplit('.', 2)
+    if len(parts) == 3 and parts[2].lower() == 'slp' and parts[1]:
+        return parts[1]
+    return 'unknown'
+
+
+def _startgg_headers():
+    h = {"Content-Type": "application/json"}
+    if STARTGG_TOKEN:
+        h["Authorization"] = f"Bearer {STARTGG_TOKEN}"
+    return h
+
+
+def _startgg_graphql(query, variables=None):
+    if not STARTGG_ENABLED:
+        return None
+    if not STARTGG_TOKEN:
+        raise RuntimeError("start.gg token is not set (startgg_config.json: token)")
+    payload = {"query": query, "variables": variables or {}}
+    resp = requests.post(
+        STARTGG_API_URL,
+        headers=_startgg_headers(),
+        json=payload,
+        timeout=STARTGG_HTTP_TIMEOUT_SECONDS,
+    )
+    data = resp.json() if resp.content else {}
+    if not resp.ok:
+        raise RuntimeError(f"start.gg HTTP {resp.status_code}: {data}")
+    if isinstance(data, dict) and data.get("errors"):
+        raise RuntimeError(f"start.gg GraphQL errors: {data.get('errors')}")
+    return data.get("data")
+
+
+def _startgg_get_event_id():
+    """Resolve event ID via GraphQL from startgg_config.json: event_slug."""
+    global _startgg_event_id_cache
+    slug = (STARTGG_EVENT_SLUG or "").strip()
+    if not slug:
+        return None
+    now = time.time()
+    with _startgg_cache_lock:
+        if _startgg_event_id_cache and _startgg_event_id_cache[0] == slug and (now - _startgg_event_id_cache[2]) < 300:
+            return _startgg_event_id_cache[1]
+
+    q = """
+    query getEventId($slug: String) {
+      event(slug: $slug) {
+        id
+        name
+      }
+    }
+    """
+    d = _startgg_graphql(q, {"slug": slug})
+    event = (d or {}).get("event") if d else None
+    event_id = str(event.get("id")) if event and event.get("id") is not None else None
+    try:
+        if event_id:
+            print(f"[STARTGG] Resolved event slug '{slug}' -> id={event_id} name='{event.get('name')}'", flush=True)
+        else:
+            print(f"[STARTGG] Failed to resolve event slug '{slug}' (no event found)", flush=True)
+    except Exception:
+        pass
+    with _startgg_cache_lock:
+        _startgg_event_id_cache = (slug, event_id, now)
+    return event_id
+
+
+def _startgg_fetch_event_sets(event_id, force=False):
+    """Fetch and cache sets for an event (slots include participants->user.discriminator)."""
+    global _startgg_sets_cache
+    now = time.time()
+    with _startgg_cache_lock:
+        if (
+            (not force)
+            and _startgg_sets_cache
+            and _startgg_sets_cache[0] == str(event_id)
+            and (now - _startgg_sets_cache[2]) < 30.0
+        ):
+            return _startgg_sets_cache[1]
+
+    q = """
+    query EventSets($eventId: ID!, $page: Int!, $perPage: Int!) {
+      event(id: $eventId) {
+        id
+        name
+        sets(page: $page, perPage: $perPage, sortType: STANDARD) {
+          pageInfo { total }
+          nodes {
+            id
+            state
+            winnerId
+            slots {
+              id
+              entrant {
+                id
+                name
+                participants {
+                  id
+                  user { discriminator }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    all_sets = []
+    page = 1
+    per_page = 99
+    total = None
+    while True:
+        d = _startgg_graphql(q, {"eventId": str(event_id), "page": page, "perPage": per_page})
+        event = (d or {}).get("event") if d else None
+        sets = (event or {}).get("sets") if event else None
+        nodes = (sets or {}).get("nodes") or []
+        page_info = (sets or {}).get("pageInfo") or {}
+        if total is None:
+            total = int(page_info.get("total") or 0)
+        all_sets.extend(nodes)
+        if len(all_sets) >= total or not nodes:
+            break
+        page += 1
+
+    with _startgg_cache_lock:
+        _startgg_sets_cache = (str(event_id), all_sets, now)
+    return all_sets
+
+
+def _startgg_find_set_for_discriminators(event_id, left_disc, right_disc):
+    """Find the best-matching set in the event containing both discriminators."""
+    left_disc = str(left_disc).lower() if left_disc is not None else ""
+    right_disc = str(right_disc).lower() if right_disc is not None else ""
+    if not left_disc or not right_disc:
+        return None
+
+    sets = _startgg_fetch_event_sets(event_id)
+    candidates = []
+    for s in sets or []:
+        slots = s.get("slots") or []
+        if len(slots) < 2:
+            continue
+        # Extract discriminator per slot (single participant expected for singles)
+        slot_discs = []
+        slot_entrants = []
+        for slot in slots[:2]:
+            ent = slot.get("entrant") if slot else None
+            slot_entrants.append(str(ent.get("id")) if ent and ent.get("id") is not None else None)
+            disc = None
+            try:
+                parts = (ent.get("participants") or []) if ent else []
+                if parts and parts[0].get("user"):
+                    disc_val = parts[0]["user"].get("discriminator")
+                    disc = str(disc_val).lower() if disc_val is not None else None
+            except Exception:
+                disc = None
+            slot_discs.append(disc)
+
+        if left_disc in slot_discs and right_disc in slot_discs:
+            state = str(s.get("state") or "").upper()
+            winner_id = s.get("winnerId")
+            # Prefer not-yet-completed sets
+            priority = 0
+            if state in ("COMPLETED", "3") or winner_id:
+                priority = 10
+            candidates.append((priority, s, slot_discs, slot_entrants))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    _, s, slot_discs, slot_entrants = candidates[0]
+    return {
+        "set_id": str(s.get("id")),
+        "state": s.get("state"),
+        "winnerId": s.get("winnerId"),
+        "entrant1_id": slot_entrants[0],
+        "entrant2_id": slot_entrants[1],
+        "entrant1_disc": slot_discs[0],
+        "entrant2_disc": slot_discs[1],
+    }
+
+
+def _startgg_mark_set_in_progress(set_id):
+    q = """
+    mutation MarkSetInProgress($setId: ID!) {
+      markSetInProgress(setId: $setId) {
+        id
+        state
+        startedAt
+      }
+    }
+    """
+    return _startgg_graphql(q, {"setId": str(set_id)})
+
+
+def _startgg_get_set_next_game_num(set_id):
+    now = time.time()
+    with _startgg_cache_lock:
+        ent = _startgg_set_games_cache.get(str(set_id))
+        if ent and (now - ent[1]) < 10.0:
+            return int(ent[0]) + 1
+
+    q = """
+    query GetSetGames($setId: ID!) {
+      set(id: $setId) {
+        id
+        games {
+          orderNum
+          winnerId
+        }
+      }
+    }
+    """
+    d = _startgg_graphql(q, {"setId": str(set_id)})
+    s = (d or {}).get("set") if d else None
+    games = (s or {}).get("games") or []
+    max_order = 0
+    for g in games:
+        try:
+            max_order = max(max_order, int(g.get("orderNum") or 0))
+        except Exception:
+            pass
+    with _startgg_cache_lock:
+        _startgg_set_games_cache[str(set_id)] = (max_order, now)
+    return int(max_order) + 1
+
+
+def _startgg_update_bracket_set(set_id, game_data):
+    q = """
+    mutation UpdateSet($setId: ID!, $gameData: [BracketSetGameDataInput!]!) {
+      updateBracketSet(setId: $setId, gameData: $gameData) {
+        id
+        state
+      }
+    }
+    """
+    return _startgg_graphql(q, {"setId": str(set_id), "gameData": game_data})
+
+
+def _startgg_report_bracket_set(set_id, winner_id, game_data):
+    q = """
+    mutation ReportSet($setId: ID!, $winnerId: ID!, $gameData: [BracketSetGameDataInput!]!) {
+      reportBracketSet(setId: $setId, winnerId: $winnerId, gameData: $gameData) {
+        id
+        state
+        winnerId
+      }
+    }
+    """
+    return _startgg_graphql(q, {"setId": str(set_id), "winnerId": str(winner_id), "gameData": game_data})
+
+
+def _startgg_set_game_data_list(set_ctx):
+    """Build the full gameData list (sorted by gameNum) for update/report calls.
+
+    start.gg mutations overwrite the set's entire game list, so we must always send
+    ALL known games each time we update.
+    """
+    try:
+        games_by_num = (set_ctx or {}).get("games_by_num") or {}
+        if not isinstance(games_by_num, dict):
+            return []
+        out = []
+        for k, v in games_by_num.items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                gn = int(v.get("gameNum") if v.get("gameNum") is not None else k)
+            except Exception:
+                continue
+            vv = dict(v)
+            vv["gameNum"] = gn
+            out.append((gn, vv))
+        out.sort(key=lambda x: x[0])
+        return [x[1] for x in out]
+    except Exception:
+        return []
+
+
+def _collect_replays_for_set(set_key):
+    """Return absolute replay paths for a set, ordered by game_num."""
+    try:
+        with _card_reader_lock:
+            games = [g for g in _card_reader_games.values() if g.get("set_key") == set_key]
+        games.sort(key=lambda g: int(g.get("game_num") or 0))
+        out = []
+        for g in games:
+            p = g.get("abs_path")
+            if p:
+                out.append(str(p))
+        return out
+    except Exception:
+        return []
+
+
+def _run_replay_manager_for_set(event_id, set_id, left_disc, right_disc, replay_paths):
+    """Run replay-manager-for-slippi CLI and write zips to ./replay-zips."""
+    try:
+        if not event_id or not set_id or not left_disc or not right_disc:
+            return
+
+        if not replay_paths:
+            print(f"[REPLAY-MANAGER] No replay paths for set {set_id}; skipping", flush=True)
+            return
+
+        node = shutil.which("node")
+        if not node:
+            print("[REPLAY-MANAGER] 'node' not found on PATH; skipping", flush=True)
+            return
+
+        cli_path = (REPLAY_MANAGER_JS_PATH or "").strip()
+        if not cli_path:
+            print("[REPLAY-MANAGER] replay_manager_js_path not set; skipping", flush=True)
+            return
+        # Allow relative paths in config.
+        if not os.path.isabs(cli_path):
+            cli_path = os.path.abspath(os.path.join(str(_BASE_DIR), cli_path))
+        if not os.path.exists(cli_path):
+            print(f"[REPLAY-MANAGER] CLI not found at {cli_path}; skipping", flush=True)
+            return
+
+        os.makedirs(REPLAY_ZIPS_DIR, exist_ok=True)
+
+        # replay-manager expects semicolon-delimited paths in one arg
+        replays_arg = ";".join([str(p) for p in replay_paths])
+
+        cmd = [
+            node,
+            cli_path,
+            "--event",
+            str(event_id),
+            "--set",
+            str(set_id),
+            "--left",
+            str(left_disc),
+            "--right",
+            str(right_disc),
+            "--replays",
+            replays_arg,
+            "--out",
+            REPLAY_ZIPS_DIR,
+        ]
+
+        # If we have a start.gg token, pass it as --key (replay-manager uses it to talk to start.gg)
+        if STARTGG_TOKEN:
+            cmd.extend(["--key", str(STARTGG_TOKEN)])
+
+        # Use the directory containing the JS file as cwd (so relative imports/assets resolve).
+        cwd = os.path.dirname(cli_path) or str(_BASE_DIR)
+        print(f"[REPLAY-MANAGER] Running for set {set_id} -> {REPLAY_ZIPS_DIR}", flush=True)
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=180)
+        if res.returncode != 0:
+            stderr = (res.stderr or "").strip()
+            stdout = (res.stdout or "").strip()
+            print(
+                f"[REPLAY-MANAGER] Failed for set {set_id} (code={res.returncode})\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}",
+                flush=True,
+            )
+            return
+
+        out = (res.stdout or "").strip()
+        if out:
+            print(f"[REPLAY-MANAGER] OK for set {set_id}:\n{out}", flush=True)
+        else:
+            print(f"[REPLAY-MANAGER] OK for set {set_id}", flush=True)
+    except subprocess.TimeoutExpired:
+        print(f"[REPLAY-MANAGER] Timed out for set {set_id}", flush=True)
+    except Exception as e:
+        print(f"[REPLAY-MANAGER] Error for set {set_id}: {e}", flush=True)
+
+
+def _slp_live_stage_and_stocks(filepath):
+    """Return (stage_id, left_stocks, right_stocks, left_char_id, right_char_id, left_costume, right_costume) best-effort for a live/partial file.
+
+    LEFT/RIGHT are determined by the lowest/highest controller port in GameStart,
+    which matches your physical left/right rule (e.g. port 1 is left of port 4).
+    """
+    info = live_slippi_info(filepath)
+
+    stage_id = None
+    try:
+        stage_id = int(info.get("start", {}).get("stage"))
+    except Exception:
+        stage_id = None
+
+    start_players = (info.get("start", {}) or {}).get("players", []) or []
+    port_nums = []
+    for p in start_players:
+        try:
+            port_nums.append(port_to_number(p.get("port")))
+        except Exception:
+            pass
+    port_nums = [p for p in port_nums if isinstance(p, int)]
+    if len(port_nums) < 2:
+        return stage_id, None, None, None, None, None, None
+
+    left_port = min(port_nums)
+    right_port = max(port_nums)
+
+    left_char = None
+    right_char = None
+    left_costume = None
+    right_costume = None
+    try:
+        for p in start_players:
+            pn = port_to_number(p.get("port"))
+            if pn == left_port:
+                left_char = p.get("character")
+                left_costume = p.get("costume")
+            elif pn == right_port:
+                right_char = p.get("character")
+                right_costume = p.get("costume")
+    except Exception:
+        left_char = None
+        right_char = None
+        left_costume = None
+        right_costume = None
+
+    last_frame = None
+    try:
+        for fr in live_slippi_frame_numbers(filepath):
+            last_frame = fr
+    except Exception:
+        last_frame = None
+
+    if last_frame is None or not hasattr(last_frame, "ports") or len(last_frame.ports) < 2:
+        return stage_id, None, None, left_char, right_char, left_costume, right_costume
+
+    def _stocks_for_port(port_num):
+        # peppi_py frame ports are ordered by ascending controller port for the active players.
+        idx = 0 if port_num == left_port else 1
+        try:
+            port_data = last_frame.ports[idx]
+            if hasattr(port_data, "leader") and "post" in port_data.leader and "stocks" in port_data.leader["post"]:
+                return port_data.leader["post"]["stocks"]
+        except Exception:
+            return None
+        return None
+
+    return (
+        stage_id,
+        _stocks_for_port(left_port),
+        _stocks_for_port(right_port),
+        left_char,
+        right_char,
+        left_costume,
+        right_costume,
+    )
+
+
+def _slp_final_stage_stocks_winner(filepath):
+    """Return (stage_id, left_stocks, right_stocks, left_char_id, right_char_id, left_costume, right_costume, winner_side_index) using full parse.
+
+    winner_side_index: 0=LEFT(min port), 1=RIGHT(max port), None=unknown
+    """
+    game = read_slippi(filepath, skip_frames=False)
+    stage_id = int(game.start.stage) if hasattr(game, "start") and hasattr(game.start, "stage") else None
+
+    ports = []
+    players = []
+    try:
+        players = list(game.start.players or [])
+        ports = [port_to_number(p.port) for p in players]
+    except Exception:
+        ports = []
+        players = []
+    ports = [p for p in ports if isinstance(p, int)]
+    if len(ports) < 2:
+        return stage_id, None, None, None, None, None, None, None
+    left_port = min(ports)
+    right_port = max(ports)
+
+    left_char = None
+    right_char = None
+    left_costume = None
+    right_costume = None
+    try:
+        for p in players:
+            pn = port_to_number(p.port)
+            if pn == left_port:
+                left_char = int(p.character)
+                left_costume = int(p.costume)
+            elif pn == right_port:
+                right_char = int(p.character)
+                right_costume = int(p.costume)
+    except Exception:
+        left_char = None
+        right_char = None
+        left_costume = None
+        right_costume = None
+
+    def _frame_idx_for_port(port_num):
+        # For 2-player games, peppi_py frame ports align to ascending controller port
+        return 0 if port_num == left_port else 1
+
+    left_idx = _frame_idx_for_port(left_port)
+    right_idx = _frame_idx_for_port(right_port)
+
+    try:
+        left_stocks = game.frames.ports[left_idx].leader.post.stocks[-1].as_py()
+        right_stocks = game.frames.ports[right_idx].leader.post.stocks[-1].as_py()
+    except Exception:
+        return stage_id, None, None, left_char, right_char, left_costume, right_costume, None
+
+    left_percent = None
+    right_percent = None
+    try:
+        left_percent = game.frames.ports[left_idx].leader.post.percent[-1].as_py()
+        right_percent = game.frames.ports[right_idx].leader.post.percent[-1].as_py()
+    except Exception:
+        left_percent = None
+        right_percent = None
+
+    winner = None
+    try:
+        if left_stocks is not None and right_stocks is not None:
+            if left_stocks > right_stocks:
+                winner = 0
+            elif right_stocks > left_stocks:
+                winner = 1
+            else:
+                if left_percent is not None and right_percent is not None:
+                    if left_percent < right_percent:
+                        winner = 0
+                    elif right_percent < left_percent:
+                        winner = 1
+    except Exception:
+        winner = None
+
+    return stage_id, left_stocks, right_stocks, left_char, right_char, left_costume, right_costume, winner
+
+
+def _enqueue_card_reader_file(abs_path):
+    parsed = _parse_card_reader_filename(abs_path)
+    if not parsed:
+        return
+    with _card_reader_lock:
+        if abs_path in _card_reader_seen_files:
+            return
+        _card_reader_seen_files.add(abs_path)
+    try:
+        _card_reader_queue.put_nowait(abs_path)
+    except Exception:
+        pass
+
+
+def _ensure_card_reader_game_registered(abs_path):
+    """Resolve start.gg set + set context for a new card_reader file."""
+    parsed = _parse_card_reader_filename(abs_path)
+    if not parsed:
+        return
+
+    event_id = _startgg_get_event_id()
+    if not event_id:
+        print("[STARTGG] Missing event_slug in startgg_config.json; cannot match sets.", flush=True)
+        return
+
+    left_disc = parsed["left_disc"]
+    right_disc = parsed["right_disc"]
+    match = _startgg_find_set_for_discriminators(event_id, left_disc, right_disc)
+    if not match:
+        print(f"[STARTGG] No set match found for {left_disc} vs {right_disc} in event {event_id}", flush=True)
+        return
+
+    set_id = match["set_id"]
+    set_key = (str(event_id), str(set_id))
+
+    with _card_reader_lock:
+        set_ctx = _card_reader_sets.get(set_key)
+        if not set_ctx:
+            next_game_num = _startgg_get_set_next_game_num(set_id)
+            set_ctx = {
+                "event_id": str(event_id),
+                "set_id": str(set_id),
+                "entrant1_id": match.get("entrant1_id"),
+                "entrant2_id": match.get("entrant2_id"),
+                "entrant1_disc": match.get("entrant1_disc"),
+                "entrant2_disc": match.get("entrant2_disc"),
+                "wins": {left_disc: 0, right_disc: 0},
+                "games_by_num": {},
+                "next_game_num": int(next_game_num),
+                "reported": False,
+                "replay_manager_done": False,
+            }
+            _card_reader_sets[set_key] = set_ctx
+
+        # Register this file as the next game for the set.
+        if abs_path not in _card_reader_games:
+            game_num = int(set_ctx.get("next_game_num") or 1)
+            set_ctx["next_game_num"] = game_num + 1
+            _card_reader_games[abs_path] = {
+                "abs_path": abs_path,
+                "filename": parsed["filename"],
+                "console": parsed["console"],
+                "left_disc": left_disc,
+                "right_disc": right_disc,
+                "event_id": str(event_id),
+                "set_id": str(set_id),
+                "set_key": set_key,
+                "game_num": game_num,
+                "finalized_reported": False,
+                "game_start_reported": False,
+                "last_live_left_stocks": None,
+                "last_live_right_stocks": None,
+                "last_sent_sig": None,
+            }
+
+    # Mark set as in-progress (best-effort)
+    try:
+        _startgg_mark_set_in_progress(set_id)
+        print(f"[STARTGG] Matched set {set_id} for {left_disc} vs {right_disc}; marked IN_PROGRESS", flush=True)
+    except Exception as e:
+        print(f"[STARTGG] Failed to mark set in progress (set_id={set_id}): {e}", flush=True)
+
+
+def _card_reader_worker_loop():
+    """Background worker: registers new files and pushes live/final updates to start.gg."""
+    if not STARTGG_ENABLED:
+        print("[STARTGG] Disabled (startgg_config.json: enabled=false)", flush=True)
+        return
+
+    if not STARTGG_TOKEN:
+        print("[STARTGG] Missing token (startgg_config.json: token); card_reader reporting is idle.", flush=True)
+        while True:
+            time.sleep(60)
+
+    if not (STARTGG_EVENT_SLUG or "").strip():
+        print("[STARTGG] Missing event_slug in startgg_config.json; card_reader reporting is idle.", flush=True)
+        while True:
+            time.sleep(60)
+
+    while True:
+        try:
+            # Register any newly-seen card_reader file(s)
+            try:
+                p = _card_reader_queue.get(timeout=1.0)
+                try:
+                    _ensure_card_reader_game_registered(p)
+                except Exception as e:
+                    print(f"[STARTGG] Register error for {p}: {e}", flush=True)
+            except queue.Empty:
+                pass
+
+            # Process all known games
+            with _card_reader_lock:
+                games = list(_card_reader_games.values())
+                sets_by_key = dict(_card_reader_sets)
+
+            for g in games:
+                abs_path = g.get("abs_path")
+                if not abs_path:
+                    continue
+                if not os.path.exists(abs_path) or os.path.getsize(abs_path) == 0:
+                    continue
+
+                set_key = g.get("set_key")
+                set_ctx = sets_by_key.get(set_key) if set_key else None
+                if not set_ctx:
+                    continue
+
+                set_id = set_ctx.get("set_id")
+                entrant1_id = set_ctx.get("entrant1_id")
+                entrant2_id = set_ctx.get("entrant2_id")
+                entrant1_disc = (set_ctx.get("entrant1_disc") or "").lower()
+                entrant2_disc = (set_ctx.get("entrant2_disc") or "").lower()
+
+                left_disc = g.get("left_disc")
+                right_disc = g.get("right_disc")
+                game_num = int(g.get("game_num") or 1)
+
+                # Determine mapping for sending entrant1Score/entrant2Score
+                def _map_scores(stocks0, stocks1):
+                    # stocks0/stocks1 are LEFT/RIGHT (min/max controller port) for this game
+                    left_stocks = stocks0
+                    right_stocks = stocks1
+                    if left_disc == entrant1_disc:
+                        return left_stocks, right_stocks
+                    if right_disc == entrant1_disc:
+                        return right_stocks, left_stocks
+                    # Fallback: keep left as entrant1
+                    return left_stocks, right_stocks
+
+                def _left_right_entrant_ids():
+                    left_ent = None
+                    right_ent = None
+                    if left_disc == entrant1_disc:
+                        left_ent = entrant1_id
+                    elif left_disc == entrant2_disc:
+                        left_ent = entrant2_id
+                    if right_disc == entrant1_disc:
+                        right_ent = entrant1_id
+                    elif right_disc == entrant2_disc:
+                        right_ent = entrant2_id
+                    return left_ent, right_ent
+
+                # If finalized, send final + winner for this game once
+                finalized_at = get_file_finalized_at(abs_path)
+                if finalized_at and not g.get("finalized_reported"):
+                    try:
+                        stage_id, s0, s1, left_char, right_char, left_costume, right_costume, winner_port = _slp_final_stage_stocks_winner(abs_path)
+                        stage_payload_id = _startgg_stage_payload_id(stage_id)
+                        enc_left = _startgg_encode_stocks_with_costume(s0, left_costume)
+                        enc_right = _startgg_encode_stocks_with_costume(s1, right_costume)
+                        e1_score, e2_score = _map_scores(enc_left, enc_right)
+
+                        winner_disc = None
+                        if winner_port == 0:
+                            winner_disc = left_disc
+                        elif winner_port == 1:
+                            winner_disc = right_disc
+
+                        winner_entrant_id = None
+                        if winner_disc == entrant1_disc:
+                            winner_entrant_id = entrant1_id
+                        elif winner_disc == entrant2_disc:
+                            winner_entrant_id = entrant2_id
+
+                        # Update this game's results
+                        game_payload = {
+                            "gameNum": int(game_num),
+                            "stageId": stage_payload_id,
+                            "entrant1Score": int(e1_score) if e1_score is not None else None,
+                            "entrant2Score": int(e2_score) if e2_score is not None else None,
+                        }
+
+                        # Character selections (best-effort)
+                        left_ent, right_ent = _left_right_entrant_ids()
+                        left_char_id = _startgg_character_payload_id(left_char)
+                        right_char_id = _startgg_character_payload_id(right_char)
+                        selections = []
+                        if left_ent and left_char_id:
+                            selections.append({"entrantId": str(left_ent), "characterId": str(left_char_id)})
+                        if right_ent and right_char_id:
+                            selections.append({"entrantId": str(right_ent), "characterId": str(right_char_id)})
+                        if selections:
+                            game_payload["selections"] = selections
+
+                        if winner_entrant_id:
+                            game_payload["winnerId"] = str(winner_entrant_id)
+                        # Remove nulls (start.gg rejects explicit null for some fields)
+                        game_payload = {k: v for k, v in game_payload.items() if v is not None}
+
+                        # Update set_ctx wins + full game history
+                        with _card_reader_lock:
+                            set_ctx2 = _card_reader_sets.get(set_key) or {}
+                            games_by_num = set_ctx2.get("games_by_num")
+                            if not isinstance(games_by_num, dict):
+                                games_by_num = {}
+                                set_ctx2["games_by_num"] = games_by_num
+
+                            games_by_num[int(game_num)] = dict(game_payload)
+
+                            if winner_disc:
+                                set_ctx2["wins"][winner_disc] = int(set_ctx2["wins"].get(winner_disc, 0)) + 1
+
+                            _card_reader_sets[set_key] = set_ctx2
+
+                            # Mark this file reported
+                            if abs_path in _card_reader_games:
+                                _card_reader_games[abs_path]["finalized_reported"] = True
+
+                            full_game_data = _startgg_set_game_data_list(set_ctx2)
+
+                        # Important: always send ALL games, otherwise we overwrite prior ones.
+                        _startgg_update_bracket_set(set_id, full_game_data)
+
+                        print(
+                            f"[STARTGG] Game {game_num} finalized for set {set_id}: "
+                            f"{left_disc}({s0}) vs {right_disc}({s1}) winner={winner_disc}",
+                            flush=True,
+                        )
+
+                        # If someone reached target wins, report the whole set
+                        with _card_reader_lock:
+                            set_ctx3 = _card_reader_sets.get(set_key)
+                            wins = dict((set_ctx3 or {}).get("wins") or {})
+                            game_data_all = _startgg_set_game_data_list(set_ctx3)
+                            already_reported = bool((set_ctx3 or {}).get("reported"))
+
+                        if not already_reported:
+                            left_w = int(wins.get(left_disc, 0))
+                            right_w = int(wins.get(right_disc, 0))
+                            if left_w >= STARTGG_SET_WINS_TO_FINISH or right_w >= STARTGG_SET_WINS_TO_FINISH:
+                                set_winner_disc = left_disc if left_w >= STARTGG_SET_WINS_TO_FINISH else right_disc
+                                set_winner_entrant = entrant1_id if set_winner_disc == entrant1_disc else entrant2_id
+                                if set_winner_entrant:
+                                    _startgg_report_bracket_set(set_id, set_winner_entrant, game_data_all)
+                                    with _card_reader_lock:
+                                        set_ctx4 = _card_reader_sets.get(set_key)
+                                        if set_ctx4:
+                                            set_ctx4["reported"] = True
+                                    print(
+                                        f"[STARTGG] Reported set {set_id} winner={set_winner_disc} "
+                                        f"score {left_w}-{right_w}",
+                                        flush=True,
+                                    )
+
+                                    # After set completion, re-report via replay-manager-for-slippi and output zip(s).
+                                    try:
+                                        with _card_reader_lock:
+                                            set_ctx_rm = _card_reader_sets.get(set_key) or {}
+                                            already_done = bool(set_ctx_rm.get("replay_manager_done"))
+                                            if not already_done:
+                                                set_ctx_rm["replay_manager_done"] = True
+                                                _card_reader_sets[set_key] = set_ctx_rm
+
+                                        if not already_done:
+                                            replay_paths = _collect_replays_for_set(set_key)
+                                            # Use start.gg slot order for replay-manager left/right
+                                            left_rm = entrant1_disc
+                                            right_rm = entrant2_disc
+                                            t = threading.Thread(
+                                                target=_run_replay_manager_for_set,
+                                                args=(str(event_id), str(set_id), left_rm, right_rm, replay_paths),
+                                                daemon=True,
+                                            )
+                                            t.start()
+                                    except Exception as e:
+                                        print(f"[REPLAY-MANAGER] Failed to start job for set {set_id}: {e}", flush=True)
+                    except Exception as e:
+                        print(f"[STARTGG] Finalize reporting failed for {abs_path}: {e}", flush=True)
+                    continue
+
+                if g.get("finalized_reported"):
+                    continue
+
+                # Live update while active
+                if not is_file_recently_active(abs_path):
+                    continue
+
+                try:
+                    stage_id, s0, s1, left_char, right_char, left_costume, right_costume = _slp_live_stage_and_stocks(abs_path)
+                except Exception:
+                    continue
+
+                stage_payload_id = _startgg_stage_payload_id(stage_id)
+
+                # Only send if we have stocks (used for game start + stock-loss triggers)
+                if s0 is None or s1 is None:
+                    continue
+
+                prev_left = g.get("last_live_left_stocks")
+                prev_right = g.get("last_live_right_stocks")
+                start_already_reported = bool(g.get("game_start_reported"))
+
+                should_send = False
+                if not start_already_reported:
+                    # Game start: first baseline update once we can read stocks.
+                    should_send = True
+                else:
+                    # Stock loss only (stocks decreasing).
+                    try:
+                        if prev_left is not None and int(s0) < int(prev_left):
+                            should_send = True
+                        if prev_right is not None and int(s1) < int(prev_right):
+                            should_send = True
+                    except Exception:
+                        should_send = False
+
+                if not should_send:
+                    continue
+
+                enc_left = _startgg_encode_stocks_with_costume(s0, left_costume)
+                enc_right = _startgg_encode_stocks_with_costume(s1, right_costume)
+                e1_score, e2_score = _map_scores(enc_left, enc_right)
+                sig = (int(game_num), stage_id, int(e1_score), int(e2_score))
+                if g.get("last_sent_sig") == sig:
+                    continue
+
+                payload = {
+                    "gameNum": int(game_num),
+                    "stageId": stage_payload_id,
+                    "entrant1Score": int(e1_score),
+                    "entrant2Score": int(e2_score),
+                }
+
+                # Only include character selections on the first (game start) update.
+                if not start_already_reported:
+                    left_ent, right_ent = _left_right_entrant_ids()
+                    left_char_id = _startgg_character_payload_id(left_char)
+                    right_char_id = _startgg_character_payload_id(right_char)
+                    selections = []
+                    if left_ent and left_char_id:
+                        selections.append({"entrantId": str(left_ent), "characterId": str(left_char_id)})
+                    if right_ent and right_char_id:
+                        selections.append({"entrantId": str(right_ent), "characterId": str(right_char_id)})
+                    if selections:
+                        payload["selections"] = selections
+
+                payload = {k: v for k, v in payload.items() if v is not None}
+
+                try:
+                    # Merge into per-set history so we don't drop selections, etc.
+                    with _card_reader_lock:
+                        set_ctx_live = _card_reader_sets.get(set_key) or {}
+                        games_by_num = set_ctx_live.get("games_by_num")
+                        if not isinstance(games_by_num, dict):
+                            games_by_num = {}
+                            set_ctx_live["games_by_num"] = games_by_num
+
+                        existing = games_by_num.get(int(game_num))
+                        merged = dict(existing) if isinstance(existing, dict) else {}
+                        merged.update(dict(payload))
+
+                        # Keep prior selections / winnerId if this incremental payload omitted them.
+                        if isinstance(existing, dict):
+                            if "selections" in existing and "selections" not in merged:
+                                merged["selections"] = existing.get("selections")
+                            if "winnerId" in existing and "winnerId" not in merged:
+                                merged["winnerId"] = existing.get("winnerId")
+
+                        merged = {k: v for k, v in merged.items() if v is not None}
+                        games_by_num[int(game_num)] = merged
+                        _card_reader_sets[set_key] = set_ctx_live
+                        full_game_data_live = _startgg_set_game_data_list(set_ctx_live)
+
+                    # Important: always send ALL games, otherwise we overwrite prior ones.
+                    _startgg_update_bracket_set(set_id, full_game_data_live)
+                except Exception as e:
+                    # Avoid tight retry loops on auth/config errors
+                    if "STARTGG_TOKEN" in str(e) or "401" in str(e):
+                        print(f"[STARTGG] Live update aborted: {e}", flush=True)
+                        time.sleep(5)
+                    continue
+
+                with _card_reader_lock:
+                    if abs_path in _card_reader_games:
+                        _card_reader_games[abs_path]["last_sent_sig"] = sig
+                        _card_reader_games[abs_path]["game_start_reported"] = True
+                        _card_reader_games[abs_path]["last_live_left_stocks"] = s0
+                        _card_reader_games[abs_path]["last_live_right_stocks"] = s1
+
+        except Exception as e:
+            print(f"[STARTGG] Worker loop error: {e}", flush=True)
+            time.sleep(1.0)
+
 
 def mark_file_activity(path):
     try:
@@ -87,6 +1207,12 @@ def mark_file_activity(path):
         with finalized_files_lock:
             # New activity means the file is no longer finalized.
             finalized_files.pop(abs_path, None)
+
+        # If this is a card_reader replay, enqueue it for start.gg processing.
+        try:
+            _enqueue_card_reader_file(abs_path)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -488,12 +1614,7 @@ class MonitoringFTPHandler(FTPHandler):
     def _start_spectatormode_stream(self, abs_path):
         if not abs_path.endswith('.slp'):
             return
-        base = os.path.basename(abs_path)
-        parts = base.rsplit('.', 2)
-        if len(parts) == 3 and parts[2] == 'slp' and parts[1]:
-            console_name = parts[1]
-        else:
-            console_name = 'unknown'
+        console_name = _console_name_from_slp_path(abs_path)
         if console_name not in MonitoringFTPHandler.console_streams:
             MonitoringFTPHandler.console_streams[console_name] = {}
         if 'spectatormode' not in MonitoringFTPHandler.console_streams[console_name]:
@@ -506,11 +1627,7 @@ class MonitoringFTPHandler(FTPHandler):
         MonitoringFTPHandler.console_streams[console_name]['spectatormode']['queue'].put(abs_path)
 
     def _get_console_name_from_path(self, abs_path):
-        base = os.path.basename(abs_path)
-        parts = base.rsplit('.', 2)
-        if len(parts) == 3 and parts[2] == 'slp' and parts[1]:
-            return parts[1]
-        return 'unknown'
+        return _console_name_from_slp_path(abs_path)
 
     def _resolve_target_fs_path(self, ftp_arg):
         """Resolve an incoming STOR/APPE/RETR argument to a filesystem path.
@@ -1255,10 +2372,7 @@ def compute_replays_snapshot():
 
                         console_name = info.get('metadata', {}).get('consoleNick')
                         if not console_name:
-                            base = os.path.basename(filepath)
-                            parts = base.rsplit('.', 2)
-                            if len(parts) == 3 and parts[2] == 'slp' and parts[1]:
-                                console_name = parts[1]
+                            console_name = _console_name_from_slp_path(filepath)
 
                         game_info = {
                             'stage_id': stage_id,
@@ -1316,13 +2430,24 @@ def compute_replays_snapshot():
                                 timer_str = frame_to_game_timer(last_frame, starting_timer_seconds)
                         except Exception as e:
                             timer_str = f"Error: {e}"
+                        console_name = None
+                        try:
+                            console_name = game.metadata['consoleNick']
+                        except Exception:
+                            try:
+                                console_name = getattr(game, 'metadata', {}).get('consoleNick')
+                            except Exception:
+                                console_name = None
+                        if not console_name:
+                            console_name = _console_name_from_slp_path(filepath)
+
                         game_info = {
                             'stage_id': stage_id,
                             'stage_name': stage_name,
                             'players': players,
                             'timer': timer_str,
                             'frame_count': frame_count,
-                            'console_name': game.metadata['consoleNick']
+                            'console_name': console_name
                         }
                 except Exception as e:
                     game_info = {'error': str(e)}
@@ -1429,6 +2554,10 @@ if __name__ == "__main__":
     if (not USE_RELOADER) or is_reloader_child:
         ftp_thread = threading.Thread(target=main, daemon=True)
         ftp_thread.start()
+
+        # start.gg worker for card_reader_*.slp reporting
+        startgg_thread = threading.Thread(target=_card_reader_worker_loop, daemon=True)
+        startgg_thread.start()
         
     load_slippilab_uploaded()
     # batch_upload_missing_to_slippilab()
