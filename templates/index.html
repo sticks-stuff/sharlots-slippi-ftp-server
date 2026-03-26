@@ -204,6 +204,19 @@
             return 'replay-checkbox-' + filename.replace(/[^a-zA-Z0-9_\-]/g, '_');
         }
 
+        function escapeHtml(s) {
+            return String(s ?? '').replace(/[&<>"']/g, (c) => {
+                switch (c) {
+                    case '&': return '&amp;';
+                    case '<': return '&lt;';
+                    case '>': return '&gt;';
+                    case '"': return '&quot;';
+                    case "'": return '&#39;';
+                    default: return c;
+                }
+            });
+        }
+
         function renderReplayRow(replay, rowIdx, isLast) {
             const isActive = replay.is_active_transfer;
             const timerKey = replay.filename.replace(/[^a-zA-Z0-9_\-]/g, '_');
@@ -759,12 +772,33 @@
                         }
                         const isExpanded = !!expandedSets[setId];
                         const toggleSymbol = isExpanded ? '▼' : '▶';
+
+                        // If this is a card_reader set with start.gg metadata, show it in the set header.
+                        let startggLabel = '';
+                        let sg = null;
+                        for (const r of cluster.replays) {
+                            if (r && r.startgg_set && (r.startgg_set.round_name || r.startgg_set.entrant1_name || r.startgg_set.entrant2_name)) {
+                                sg = r.startgg_set;
+                                break;
+                            }
+                        }
+                        if (sg) {
+                            const round = (sg.round_name || '').trim();
+                            const a = (sg.entrant1_name || '').trim();
+                            const b = (sg.entrant2_name || '').trim();
+                            if (a || b || round) {
+                                const rn = round ? (escapeHtml(round) + ' - ') : '';
+                                startggLabel = rn + escapeHtml(a || sg.entrant1_disc || '') + ' vs ' + escapeHtml(b || sg.entrant2_disc || '');
+                            }
+                        }
+                        const startggLabelHtml = startggLabel ? ('<span>' + startggLabel + '</span>') : '';
                         html += `<tr><td colspan='2' class='set-header' style='display:flex;align-items:center;justify-content:space-between;'>
                             <span style="display:flex;align-items:center;gap:8px;">
                                 <button class="set-toggle-btn" data-set-id="${setId}" style="cursor:pointer;">${toggleSymbol}</button>
                                 <span>${scoreDisplay}</span>
                             </span>
                             <span style="display:flex;align-items:center;gap:8px;">
+                                ${startggLabelHtml}
                                 <span>${totalStr}</span>
                                 <button class="export-set-btn" id="${setExportBtnId}" data-urls="${setReplayUrls}" style="margin-left:8px;"><img alt="Replay Manager" src="/assets/replay-manager.png" width="18" height="18">Report</button>
                             </span>

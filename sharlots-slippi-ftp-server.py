@@ -49,6 +49,63 @@ spectatormode_live_files = {}
 SLIPPILAB_UPLOADS_FILE = "slippilab_uploaded.json"
 slippilab_uploaded = {}  # {abs_path: slippilab_id}
 
+# Cached start.gg metadata for card_reader sets (for UI display)
+CARD_READER_SET_META_PATH = str(_BASE_DIR / "card_reader_set_meta.json")
+_card_reader_set_meta_lock = threading.Lock()
+
+
+def _card_reader_pair_key(left_disc, right_disc):
+    a = (str(left_disc) if left_disc is not None else "").strip().lower()
+    b = (str(right_disc) if right_disc is not None else "").strip().lower()
+    if not a or not b:
+        return None
+    return "|".join(sorted([a, b]))
+
+
+def _load_card_reader_set_meta():
+    if not os.path.exists(CARD_READER_SET_META_PATH):
+        return {}
+    try:
+        with open(CARD_READER_SET_META_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            return {}
+
+        # Back-compat: older formats included either:
+        # - flat {"<left>|<right>": meta_entry} (pair-keyed; collision-prone)
+        # - {"_schema": 1, "by_file": {...}, "by_pair": {...}}
+        # We intentionally ignore any pair-keyed data to avoid showing the wrong round/names.
+        by_file = d.get("by_file") if isinstance(d.get("by_file"), dict) else {}
+        return {"_schema": int(d.get("_schema") or 2), "by_file": by_file}
+    except Exception as e:
+        print(f"[STARTGG] Failed to load {CARD_READER_SET_META_PATH}: {e}", flush=True)
+        return {}
+
+
+def _save_card_reader_set_meta(meta):
+    try:
+        tmp = CARD_READER_SET_META_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta or {}, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, CARD_READER_SET_META_PATH)
+    except Exception as e:
+        print(f"[STARTGG] Failed to save {CARD_READER_SET_META_PATH}: {e}", flush=True)
+
+
+_card_reader_set_meta = _load_card_reader_set_meta()
+
+# Rewrite the on-disk file to the current schema (dropping any legacy by_pair data).
+try:
+    if os.path.exists(CARD_READER_SET_META_PATH):
+        with open(CARD_READER_SET_META_PATH, "r", encoding="utf-8") as f:
+            _raw = json.load(f)
+        if isinstance(_raw, dict) and (_raw.get("by_pair") is not None or "by_pair" in _raw):
+            _save_card_reader_set_meta(_card_reader_set_meta)
+        elif isinstance(_raw, dict) and "by_file" not in _raw and "by_pair" not in _raw:
+            _save_card_reader_set_meta(_card_reader_set_meta)
+except Exception:
+    pass
+
 # Optional CSV mapping for creation times (epoch seconds) by filename
 CREATION_TIMES_CSV = "creation_times.csv"
 creation_times_map = {}
@@ -433,6 +490,58 @@ def api_get_sound(discriminator):
     return Response(val, mimetype="text/plain")
 
 
+@app.get("/api/is-ended")
+def api_is_ended():
+    left = (request.args.get("left") or "").strip().lower()
+    right = (request.args.get("right") or "").strip().lower()
+    if not left or not right:
+        return Response("", status=400, mimetype="text/plain")
+
+    wanted = {left, right}
+    ended = False
+    with _card_reader_lock:
+        sets_snapshot = list(_card_reader_sets.values())
+
+    for set_ctx in sets_snapshot:
+        if not isinstance(set_ctx, dict):
+            continue
+
+        # Prefer the explicit entrant discriminators if present, otherwise fall back to
+        # the keys we track in the per-set wins dict.
+        a = (set_ctx.get("entrant1_disc") or "").strip().lower()
+        b = (set_ctx.get("entrant2_disc") or "").strip().lower()
+        if a and b:
+            pair = {a, b}
+        else:
+            wins = set_ctx.get("wins") or {}
+            if isinstance(wins, dict):
+                pair = {str(k).strip().lower() for k in wins.keys() if str(k).strip()}
+            else:
+                pair = set()
+
+        if wanted != pair:
+            continue
+
+        if bool(set_ctx.get("ended")):
+            ended = True
+            break
+
+        if bool(set_ctx.get("reported")):
+            ended = True
+            break
+
+        wins = set_ctx.get("wins") or {}
+        if isinstance(wins, dict):
+            try:
+                if any(int(v) >= int(STARTGG_SET_WINS_TO_FINISH) for v in wins.values()):
+                    ended = True
+                    break
+            except Exception:
+                pass
+
+    return Response("true" if ended else "false", mimetype="text/plain")
+
+
 @app.get("/sounds/<path:filename>")
 def get_sound_file(filename):
     # Only allow serving by basename from SCAN_SOUNDS_DIR.
@@ -700,6 +809,7 @@ def _startgg_fetch_event_sets(event_id, force=False):
           pageInfo { total }
           nodes {
             id
+                        fullRoundText
             state
             winnerId
             slots {
@@ -756,9 +866,11 @@ def _startgg_find_set_for_discriminators(event_id, left_disc, right_disc):
         # Extract discriminator per slot (single participant expected for singles)
         slot_discs = []
         slot_entrants = []
+        slot_names = []
         for slot in slots[:2]:
             ent = slot.get("entrant") if slot else None
             slot_entrants.append(str(ent.get("id")) if ent and ent.get("id") is not None else None)
+            slot_names.append(str(ent.get("name")) if ent and ent.get("name") is not None else None)
             disc = None
             try:
                 parts = (ent.get("participants") or []) if ent else []
@@ -776,20 +888,23 @@ def _startgg_find_set_for_discriminators(event_id, left_disc, right_disc):
             priority = 0
             if state in ("COMPLETED", "3") or winner_id:
                 priority = 10
-            candidates.append((priority, s, slot_discs, slot_entrants))
+            candidates.append((priority, s, slot_discs, slot_entrants, slot_names))
 
     if not candidates:
         return None
     candidates.sort(key=lambda x: x[0])
-    _, s, slot_discs, slot_entrants = candidates[0]
+    _, s, slot_discs, slot_entrants, slot_names = candidates[0]
     return {
         "set_id": str(s.get("id")),
+        "round_name": s.get("fullRoundText"),
         "state": s.get("state"),
         "winnerId": s.get("winnerId"),
         "entrant1_id": slot_entrants[0],
         "entrant2_id": slot_entrants[1],
         "entrant1_disc": slot_discs[0],
         "entrant2_disc": slot_discs[1],
+        "entrant1_name": slot_names[0] if len(slot_names) > 0 else None,
+        "entrant2_name": slot_names[1] if len(slot_names) > 1 else None,
     }
 
 
@@ -1178,6 +1293,30 @@ def _ensure_card_reader_game_registered(abs_path):
     set_id = match["set_id"]
     set_key = (str(event_id), str(set_id))
 
+    # Persist round + entrant names for UI display.
+    # Key strictly by replay filename so repeated matches between the same two
+    # players don't overwrite each other.
+    base_name = os.path.basename(abs_path or "")
+    meta_entry = {
+        "event_id": str(event_id),
+        "set_id": str(set_id),
+        "round_name": match.get("round_name") or "",
+        "entrant1_name": match.get("entrant1_name") or "",
+        "entrant2_name": match.get("entrant2_name") or "",
+        "entrant1_disc": match.get("entrant1_disc") or "",
+        "entrant2_disc": match.get("entrant2_disc") or "",
+        "updated_at": time.time(),
+    }
+    with _card_reader_set_meta_lock:
+        meta = _card_reader_set_meta if isinstance(_card_reader_set_meta, dict) else {}
+        by_file = meta.get("by_file") if isinstance(meta.get("by_file"), dict) else {}
+        if base_name:
+            by_file[base_name] = meta_entry
+        meta["_schema"] = int(meta.get("_schema") or 2)
+        meta["by_file"] = by_file
+        _card_reader_set_meta.update(meta)
+        _save_card_reader_set_meta(_card_reader_set_meta)
+
     with _card_reader_lock:
         set_ctx = _card_reader_sets.get(set_key)
         if not set_ctx:
@@ -1185,10 +1324,13 @@ def _ensure_card_reader_game_registered(abs_path):
             set_ctx = {
                 "event_id": str(event_id),
                 "set_id": str(set_id),
+                "round_name": match.get("round_name"),
                 "entrant1_id": match.get("entrant1_id"),
                 "entrant2_id": match.get("entrant2_id"),
                 "entrant1_disc": match.get("entrant1_disc"),
                 "entrant2_disc": match.get("entrant2_disc"),
+                "entrant1_name": match.get("entrant1_name"),
+                "entrant2_name": match.get("entrant2_name"),
                 "wins": {left_disc: 0, right_disc: 0},
                 "games_by_num": {},
                 "next_game_num": int(next_game_num),
@@ -1311,6 +1453,46 @@ def _card_reader_worker_loop():
                 if finalized_at and not g.get("finalized_reported"):
                     try:
                         stage_id, s0, s1, left_char, right_char, left_costume, right_costume, winner_port = _slp_final_stage_stocks_winner(abs_path)
+
+                        # Mirror the web UI's "ignored" logic: if both players still have >1
+                        # stock at the end, it was almost certainly a quit-out / non-game.
+                        # In that case: do not count a win and do not include the game in
+                        # start.gg gameData.
+                        ignore_for_reporting = False
+                        try:
+                            if s0 is not None and s1 is not None:
+                                if int(s0) > 1 and int(s1) > 1:
+                                    ignore_for_reporting = True
+                        except Exception:
+                            ignore_for_reporting = False
+
+                        if ignore_for_reporting:
+                            with _card_reader_lock:
+                                set_ctx2 = _card_reader_sets.get(set_key) or {}
+                                games_by_num = set_ctx2.get("games_by_num")
+                                if not isinstance(games_by_num, dict):
+                                    games_by_num = {}
+                                    set_ctx2["games_by_num"] = games_by_num
+                                # Remove any previously-sent live baseline for this game
+                                # and resend the full list.
+                                games_by_num.pop(int(game_num), None)
+                                _card_reader_sets[set_key] = set_ctx2
+
+                                if abs_path in _card_reader_games:
+                                    _card_reader_games[abs_path]["finalized_reported"] = True
+                                    _card_reader_games[abs_path]["ignored_for_reporting"] = True
+
+                                full_game_data = _startgg_set_game_data_list(set_ctx2)
+
+                            # Best-effort: overwrite start.gg gameData without this ignored game.
+                            _startgg_update_bracket_set(set_id, full_game_data)
+                            print(
+                                f"[STARTGG] Ignored quit-out game {game_num} for set {set_id}: "
+                                f"{left_disc}({s0}) vs {right_disc}({s1})",
+                                flush=True,
+                            )
+                            continue
+
                         stage_payload_id = _startgg_stage_payload_id(stage_id)
                         enc_left = _startgg_encode_stocks_with_costume(s0, left_costume)
                         enc_right = _startgg_encode_stocks_with_costume(s1, right_costume)
@@ -1383,54 +1565,55 @@ def _card_reader_worker_loop():
                             flush=True,
                         )
 
-                        # If someone reached target wins, report the whole set
+                        # If someone reached target wins, do NOT report the set here.
+                        # Replay Manager will do the final report (including winner) to avoid conflicts.
                         with _card_reader_lock:
                             set_ctx3 = _card_reader_sets.get(set_key)
                             wins = dict((set_ctx3 or {}).get("wins") or {})
                             game_data_all = _startgg_set_game_data_list(set_ctx3)
-                            already_reported = bool((set_ctx3 or {}).get("reported"))
+                            already_ended = bool((set_ctx3 or {}).get("ended"))
 
-                        if not already_reported:
+                        if not already_ended:
                             left_w = int(wins.get(left_disc, 0))
                             right_w = int(wins.get(right_disc, 0))
                             if left_w >= STARTGG_SET_WINS_TO_FINISH or right_w >= STARTGG_SET_WINS_TO_FINISH:
                                 set_winner_disc = left_disc if left_w >= STARTGG_SET_WINS_TO_FINISH else right_disc
                                 set_winner_entrant = entrant1_id if set_winner_disc == entrant1_disc else entrant2_id
-                                if set_winner_entrant:
-                                    _startgg_report_bracket_set(set_id, set_winner_entrant, game_data_all)
+                                # Mark ended and kick Replay Manager once
+                                with _card_reader_lock:
+                                    set_ctx4 = _card_reader_sets.get(set_key)
+                                    if set_ctx4:
+                                        set_ctx4["ended"] = True
+
+                                print(
+                                    f"[STARTGG] Set ended {set_id} winner={set_winner_disc} "
+                                    f"score {left_w}-{right_w} (final reporting via Replay Manager)",
+                                    flush=True,
+                                )
+
+                                # After set completion, report via replay-manager-for-slippi and output zip(s).
+                                try:
                                     with _card_reader_lock:
-                                        set_ctx4 = _card_reader_sets.get(set_key)
-                                        if set_ctx4:
-                                            set_ctx4["reported"] = True
-                                    print(
-                                        f"[STARTGG] Reported set {set_id} winner={set_winner_disc} "
-                                        f"score {left_w}-{right_w}",
-                                        flush=True,
-                                    )
-
-                                    # After set completion, re-report via replay-manager-for-slippi and output zip(s).
-                                    try:
-                                        with _card_reader_lock:
-                                            set_ctx_rm = _card_reader_sets.get(set_key) or {}
-                                            already_done = bool(set_ctx_rm.get("replay_manager_done"))
-                                            if not already_done:
-                                                set_ctx_rm["replay_manager_done"] = True
-                                                _card_reader_sets[set_key] = set_ctx_rm
-
+                                        set_ctx_rm = _card_reader_sets.get(set_key) or {}
+                                        already_done = bool(set_ctx_rm.get("replay_manager_done"))
                                         if not already_done:
-                                            replay_paths = _collect_replays_for_set(set_key)
-                                            # Use start.gg slot order for replay-manager left/right
-                                            left_rm = entrant1_disc
-                                            right_rm = entrant2_disc
-                                            event_id_val = _startgg_get_event_id()
-                                            t = threading.Thread(
-                                                target=_run_replay_manager_for_set,
-                                                args=(str(event_id_val), str(set_id), left_rm, right_rm, replay_paths),
-                                                daemon=True,
-                                            )
-                                            t.start()
-                                    except Exception as e:
-                                        print(f"[REPLAY-MANAGER] Failed to start job for set {set_id}: {e}", flush=True)
+                                            set_ctx_rm["replay_manager_done"] = True
+                                            _card_reader_sets[set_key] = set_ctx_rm
+
+                                    if not already_done:
+                                        replay_paths = _collect_replays_for_set(set_key)
+                                        # Use start.gg slot order for replay-manager left/right
+                                        left_rm = entrant1_disc
+                                        right_rm = entrant2_disc
+                                        event_id_val = _startgg_get_event_id()
+                                        t = threading.Thread(
+                                            target=_run_replay_manager_for_set,
+                                            args=(str(event_id_val), str(set_id), left_rm, right_rm, replay_paths),
+                                            daemon=True,
+                                        )
+                                        t.start()
+                                except Exception as e:
+                                    print(f"[REPLAY-MANAGER] Failed to start job for set {set_id}: {e}", flush=True)
                     except Exception as e:
                         print(f"[STARTGG] Finalize reporting failed for {abs_path}: {e}", flush=True)
                     continue
@@ -2626,6 +2809,10 @@ def compute_replays_snapshot():
     replays = []
     active_filepaths = set()
 
+    with _card_reader_set_meta_lock:
+        meta_root = dict(_card_reader_set_meta) if isinstance(_card_reader_set_meta, dict) else {}
+        meta_by_file = meta_root.get("by_file") if isinstance(meta_root.get("by_file"), dict) else {}
+
     # Build set of active filepaths
     for conn in MonitoringFTPHandler.active_connections:
         if conn.get('transfer_active'):
@@ -2827,6 +3014,27 @@ def compute_replays_snapshot():
                 'is_active_transfer': is_active,
                 'game_info': game_info
             })
+
+            # Attach start.gg metadata for card_reader sets (used by the web UI)
+            try:
+                parsed_cr = _parse_card_reader_filename(filename)
+                if parsed_cr:
+                    meta = meta_by_file.get(filename)
+                    sg = {
+                        'pair_key': _card_reader_pair_key(parsed_cr.get('left_disc'), parsed_cr.get('right_disc')),
+                        'left_disc': parsed_cr.get('left_disc'),
+                        'right_disc': parsed_cr.get('right_disc'),
+                        'round_name': (meta or {}).get('round_name') if isinstance(meta, dict) else None,
+                        'entrant1_name': (meta or {}).get('entrant1_name') if isinstance(meta, dict) else None,
+                        'entrant2_name': (meta or {}).get('entrant2_name') if isinstance(meta, dict) else None,
+                        'entrant1_disc': (meta or {}).get('entrant1_disc') if isinstance(meta, dict) else None,
+                        'entrant2_disc': (meta or {}).get('entrant2_disc') if isinstance(meta, dict) else None,
+                        'set_id': (meta or {}).get('set_id') if isinstance(meta, dict) else None,
+                        'event_id': (meta or {}).get('event_id') if isinstance(meta, dict) else None,
+                    }
+                    replays[-1]['startgg_set'] = sg
+            except Exception:
+                pass
 
     replays.sort(key=lambda x: x['filename'], reverse=True)
     return {
